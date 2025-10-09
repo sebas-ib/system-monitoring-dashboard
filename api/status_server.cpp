@@ -3,10 +3,29 @@
 //
 
 #include <string>
+#include <thread>
+#include <atomic>
+#include "chrono"
 #include "third_party/httplib.h"
+#include "store/memory_store.h"
+
+std::atomic<bool> running(true);
+static MemoryStore store; // Creating global memory before main runs
+
+void backgroundLoopFunction(){
+    while(running){
+        auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        double test_value = 10 + (std::rand() % 90); // Fake CPU readings
+        store.append("cpu.total_pct", now, test_value);
+        printf("Appended sample: %s %lld -> %.2f\n", "cpu.total_pct", now, test_value);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
 
 int main() {
     httplib::Server svr;
+    auto beginning = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::thread background_thread(backgroundLoopFunction);
 
     // CORS
     svr.set_default_headers({
@@ -27,14 +46,20 @@ int main() {
                 "application/json");
     });
 
-
-    // Optional OPTIONS preflight
-    svr.Options("api/status", [](const httplib::Request &, httplib::Response &res) {
-        res.status = 204;
+    svr.Get("/api/timeseries", [](const httplib::Request &, httplib::Response& res) {
+        auto data = store.query("cpu.total_pct",0, std::numeric_limits<int64_t>::max());
+        std::string out = "Samples: " + std::to_string(data.size()) + "\n";
+        res.set_content(out,"text/plain");
     });
+
 
     // Listen on all interfaces so other devices on LAN can hit it
     const char *host = "0.0.0.0";
     int port = 8080;
-    return svr.listen(host, port) ? 0 : 1;
+
+    bool completed = svr.listen(host, port);
+
+    running = false;
+    background_thread.join();
+    return completed ;
 }
