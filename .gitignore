@@ -1,0 +1,26 @@
+# IDE files
+.idea/
+.vscode/
+
+# Build output
+cmake-build-debug/
+cmake-build-release/
+build/
+out/
+
+# CMake cache and binaries
+CMakeCache.txt
+CMakeFiles/
+Testing/
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+*.ninja
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db

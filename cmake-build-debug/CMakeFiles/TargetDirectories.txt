@@ -1,3 +1,0 @@
-/Users/sebastian/cpp-projects/system-monitoring-dashboard/cmake-build-debug/CMakeFiles/system_monitoring_dashboard.dir
-/Users/sebastian/cpp-projects/system-monitoring-dashboard/cmake-build-debug/CMakeFiles/edit_cache.dir
-/Users/sebastian/cpp-projects/system-monitoring-dashboard/cmake-build-debug/CMakeFiles/rebuild_cache.dir
