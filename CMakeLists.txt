@@ -1,17 +1,31 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.16)
 project(system_monitoring_dashboard CXX)
-
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Add include path (for third_party/httplib.h)
-include_directories(${CMAKE_SOURCE_DIR}/include)
+# Headers
+include_directories(${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
 
-# Minimal server target
-add_executable(smd_server
+# Pick collectors by OS
+set(COLLECTOR_SRCS collector/loop.cpp)
+if(APPLE)
+    list(APPEND COLLECTOR_SRCS
+            collector/cpu_macos.cpp
+            collector/memory_macos.cpp
+            # collector/disk_macos.cpp
+            # collector/net_macos.cpp
+    )
+else() # Linux
+    list(APPEND COLLECTOR_SRCS
+            collector/cpu_linux.cpp
+            collector/memory_linux.cpp
+            collector/disk_linux.cpp
+            collector/net_linux.cpp
+    )
+endif()
+
+add_executable(dashboard
+        main.cpp
         api/status_server.cpp
         store/memory_store.cpp
+        ${COLLECTOR_SRCS}
 )
-
-# On macOS you don’t need extra libs for httplib’s default HTTP (no OpenSSL).
-# If you later enable HTTPS, you’d link OpenSSL.

@@ -26,6 +26,27 @@ Defines which metrics are collected and stored, how they are named, labeled, and
 | **Processes (summary)** | `proc.count`       | Total running processes                 | count     | host            |                                     |
 |                         | `proc.top`         | Top N processes by CPU% and RSS         | table     | host, pid, comm | (returned via API table)            |
 
+
+### Future Metrics
+CPU:
+  cpu.total_pct
+  cpu.core_pct{core}
+  cpu.load1, cpu.load5, cpu.load15
+Memory:
+  mem.used_bytes (wired+active+compressed)
+  mem.cached_bytes (inactive(+speculative))
+  mem.available_bytes
+  swap.used_bytes
+  mem.pageins_per_s, mem.pageouts_per_s
+Disk:
+  disk.read_bytes_per_s{dev}
+  disk.write_bytes_per_s{dev}
+Network:
+  net.rx_bytes_per_s{iface}
+  net.tx_bytes_per_s{iface}
+Processes (table, not timeseries at first):
+  pid, comm, cpu_pct, rss_bytes, threads
+
 ### Sampling Strategy
 
 | Tier            | Interval | Purpose                                                                |
