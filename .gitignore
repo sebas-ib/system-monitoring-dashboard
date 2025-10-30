@@ -1,41 +1,56 @@
-# IDE files
 .idea/
 .vscode/
+*.xcuserdata/
+*.xcuserstate
+*.swp
+*~
 
-# Build output
-cmake-build-debug/
-cmake-build-release/
-build/
-out/
-
-# CMake cache and binaries
-CMakeCache.txt
-CMakeFiles/
-Testing/
-*.o
-*.obj
-*.a
-*.so
-*.dll
-*.exe
-*.ninja
-*.log
-
-# OS junk
-.DS_Store
-Thumbs.db
-
-
-# Build folders
 cmake-build-*/
-build/
+build*/
+out*/
 tmp/
 .cmake/
 
-# IDE
-.idea/
-*.user
-*.DS_Store
+CMakeCache.txt
+CMakeFiles/
+Testing/
+Makefile
+*.ninja
+.ninja_deps
+.ninja_log
 
-# Logs
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+
 *.log
+*.pid
+*.seed
+*.tmp
+
+
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*~
+
+
+vcpkg_installed/
+vcpkg_downloads/
+
+
+data/
+export/
+*.csv
+*.json
+!web/*.json   # keep web assets if you have static JSON
