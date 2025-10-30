@@ -24,3 +24,18 @@ Testing/
 # OS junk
 .DS_Store
 Thumbs.db
+
+
+# Build folders
+cmake-build-*/
+build/
+tmp/
+.cmake/
+
+# IDE
+.idea/
+*.user
+*.DS_Store
+
+# Logs
+*.log
