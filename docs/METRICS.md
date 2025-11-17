@@ -20,7 +20,6 @@ Defines which metrics are collected and stored, how they are named, labeled, and
 |                         | `mem.free_bytes`   | Free memory available                   | bytes     | host            |                                     |
 | **Disk I/O**            | `disk.read_bytes`  | Bytes read per interval                 | bytes/sec | host, dev       | `disk.read_bytes{dev=sda}`          |
 |                         | `disk.write_bytes` | Bytes written per interval              | bytes/sec | host, dev       | `disk.write_bytes{dev=sda}`         |
-|                         | `disk.util_pct`    | Disk utilization percentage (optional)  | %         | host, dev       |                                     |
 | **Network**             | `net.rx_bytes`     | Bytes received per interval             | bytes/sec | host, iface     | `net.rx_bytes{iface=en0}`           |
 |                         | `net.tx_bytes`     | Bytes transmitted per interval          | bytes/sec | host, iface     | `net.tx_bytes{iface=en0}`           |
 | **Processes (summary)** | `proc.count`       | Total running processes                 | count     | host            |                                     |

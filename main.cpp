@@ -3,14 +3,26 @@
 #include "store/memory_store.h"
 #include "collector/loop.h"
 #include "api/routes.h"
+#include "store/system_info.h"
 #include "config.h"
 
 int main() {
     std::atomic<bool> running(true);
     MemoryStore store(cfg::KEEP_SECONDS, cfg::SAMPLE_PERIOD_S);
 
+    SystemInfo sys = collect_system_info();
+
+    store.put_metadata("system", {
+            {"cpu_cores", sys.cpu_cores},
+            {"mem_total_bytes", sys.mem_total_bytes},
+            {"hostname", sys.hostname},
+            {"os_name", sys.os_name},
+            {"kernel_version", sys.kernel_version}
+    });
+
     // start sampler
     auto bg = start_sampler(store, running);
+
 
     // start server
     httplib::Server svr;
@@ -21,6 +33,7 @@ int main() {
 
     running = false;
     if (bg.joinable()) bg.join();
+
     return ok ? 0 : 1;
 }
 

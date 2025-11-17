@@ -64,6 +64,7 @@ bool get_system_memory_bytes(MemBytes& mb) {
         const uint64_t avail = itAvail->second;
         mb.free_bytes = avail;                                      // MemAvailable is free memory
         mb.used_bytes = (total > avail) ? (total - avail) : 0ULL;   // Used is total - free
+        mb.total_bytes = total;
         return true;
     }
 
@@ -79,5 +80,6 @@ bool get_system_memory_bytes(MemBytes& mb) {
 
     mb.free_bytes = avail;
     mb.used_bytes = (total > avail) ? (total - avail) : 0ULL;
+    mb.total_bytes = total;
     return true;
 }

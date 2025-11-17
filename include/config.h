@@ -24,7 +24,7 @@ namespace cfg {
     }
 
     inline constexpr int SAMPLE_PERIOD_S   = 1;
-    inline constexpr int KEEP_SECONDS      = 20;   // ring capacity hint
+    inline constexpr int KEEP_SECONDS      = 7200;   // ring capacity hint
     inline const std::string HOST_LABEL    = resolve_host_name();
 }
 

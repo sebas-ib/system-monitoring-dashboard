@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <title>Processes</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet"
+          integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@6.0.0/dist/echarts.min.js"></script>
+    <link href="styles.css" rel="stylesheet">
+</head>
+
+<body>
+<div class="dashboard">
+    <!-- LEFT: Processes -->
+    <div class="card">
+        <h1>Processes</h1>
+        <div class="table-wrap">
+            <table id="proc-table">
+                <colgroup>
+                    <col style="width:80px">
+                    <col style="width:220px">
+                    <col style="width:90px">
+                    <col style="width:120px">
+                    <col style="width:140px">
+                    <col style="width:90px">
+                    <col style="width:70px">
+                    <col style="width:80px">
+                    <col style="width:90px">
+                    <col style="width:110px">
+                    <col style="width:90px">
+                    <col style="width:90px">
+                    <col style="width:140px">
+                </colgroup>
+                <thead>
+                <tr>
+                    <th>PID<div class="grip"></div></th>
+                    <th>Command<div class="grip"></div></th>
+                    <th>% CPU<div class="grip"></div></th>
+                    <th>CPU Time (s)<div class="grip"></div></th>
+                    <th>Idle Wake-ups/s<div class="grip"></div></th>
+                    <th>% Mem<div class="grip"></div></th>
+                    <th>Nice<div class="grip"></div></th>
+                    <th>PPID<div class="grip"></div></th>
+                    <th>Priority<div class="grip"></div></th>
+                    <th>RSS (MB)<div class="grip"></div></th>
+                    <th>State<div class="grip"></div></th>
+                    <th>Threads<div class="grip"></div></th>
+                    <th>User<div class="grip"></div></th>
+                </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="tabs" role="tablist" aria-label="Metrics">
+            <button class="tab-btn" role="tab" id="tab-cpu"   aria-controls="panel-cpu"   aria-selected="true">CPU</button>
+            <button class="tab-btn" role="tab" id="tab-mem"   aria-controls="panel-mem"   aria-selected="false">Memory</button>
+            <button class="tab-btn" role="tab" id="tab-disk"  aria-controls="panel-disk"  aria-selected="false">Disk</button>
+            <button class="tab-btn" role="tab" id="tab-net"   aria-controls="panel-net"   aria-selected="false">Network</button>
+        </div>
+
+        <div id="panel-cpu" class="panel">
+            <div id="chart-obj"></div>
+            <div id="chart-cores"></div>
+        </div>
+
+        <!-- ADD: Memory panel with container for multiple mem.* charts -->
+        <div id="panel-mem" class="panel hidden">
+            <div id="mem-charts" aria-live="polite"></div>
+        </div>
+
+        <!-- (Optional placeholders you can implement later) -->
+        <div id="panel-disk" class="panel hidden"></div>
+        <div id="panel-net"  class="panel hidden"></div>
+    </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

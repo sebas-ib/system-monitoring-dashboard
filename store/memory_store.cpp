@@ -67,6 +67,26 @@ void MemoryStore::append(const std::string &metric, std::int64_t ts_ms, double v
     }
 }
 
+
+void MemoryStore::append_vector(const std::string& metric, int64_t ts_ms, std::vector<double> vals) {
+    // Access or create vector series
+    VecSeries* vs = nullptr;
+
+    {
+        std::scoped_lock lk(vec_mtx_);
+        auto[it, inserted] = vec_series_.try_emplace(metric, per_metric_capacity_);
+        vs = &it->second;
+    }
+
+    // Append under the series lock
+    {
+        std::scoped_lock lk(vs->mtx);
+        vs->ring.append(SampleVec{ts_ms, std::move(vals)});
+    }
+}
+
+
+
 /**
  * Return samples in the inclusive time range [from_ms, to_ms] for 'metric'.
  * If the metric does not exist, returns an empty vector.
@@ -86,6 +106,23 @@ std::vector<Sample> MemoryStore::query(const std::string &metric, std::int64_t f
     // Lock the Series to read a consistent snapshot from the ring.
     std::scoped_lock ls(s->mtx);
     return s->ring.range(from_ms, to_ms);
+}
+
+std::vector<SampleVec> MemoryStore::query_vector(const std::string& metric, int64_t from_ms, int64_t to_ms) const {
+    const VecSeries* vs = nullptr;
+
+    {
+        std::scoped_lock lk(vec_mtx_);
+        auto it = vec_series_.find(metric);
+        if (it == vec_series_.end()) return {};
+        vs = &it->second;
+    }
+
+    // Read under series lock
+    std::scoped_lock lk(vs->mtx);
+
+    // Use RingBuffer::range() to support from/to
+    return vs->ring.range(from_ms, to_ms);
 }
 
 /**
@@ -131,3 +168,54 @@ const MemoryStore::Series *MemoryStore::find_series_(const std::string &metric) 
     auto it = series_.find(metric);
     return (it == series_.end()) ? nullptr : &it->second;
 }
+
+//std::vector<std::string> MemoryStore::list_series_keys() const {
+//    std::scoped_lock lk(map_mtx_);
+//    std::vector<std::string> keys;
+//    keys.reserve(series_.size());
+//    for (const auto& kv : series_) keys.push_back(kv.first);
+//    return keys;
+//}
+
+std::vector<std::string> MemoryStore::list_series_keys() const {
+    std::vector<std::string> keys;
+
+    {
+        std::scoped_lock lk(map_mtx_);
+        keys.reserve(series_.size());
+        for (const auto& kv : series_) {
+            keys.push_back(kv.first);      // scalar series
+        }
+    }
+
+    {
+        std::scoped_lock lk(vec_mtx_);
+        for (const auto& kv : vec_series_) {
+            keys.push_back(kv.first);      // vector series (like "cpu.core_pct{host=ubuntu}")
+        }
+    }
+
+    return keys;
+}
+
+void MemoryStore::put_metadata(const std::string &key, const nlohmann::json &value) {
+    std::scoped_lock lk(meta_mtx_);
+    metadata_[key] = value;
+}
+
+nlohmann::json MemoryStore::all_metadata() const {
+    std::scoped_lock lk(meta_mtx_);
+    nlohmann::json out = nlohmann::json::object();
+    for(const auto& pair: metadata_){
+        out[pair.first] = pair.second;
+    }
+    return out;
+}
+
+nlohmann::json MemoryStore::get_metadata(const std::string &key) const {
+    std::scoped_lock lk(meta_mtx_);
+    if (metadata_.count(key)) return metadata_.at(key);
+    return {};
+}
+
+

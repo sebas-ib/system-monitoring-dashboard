@@ -35,20 +35,16 @@ static const std::unordered_map<std::string, MetricDesc> kRegistry = {
         {"cpu.core_pct",    {"%",        {"host","core"}}},
 
         // Memory
-        {"mem.used_bytes",  {"bytes",    {"host"}}},
-        {"mem.free_bytes",  {"bytes",    {"host"}}},
+        {"mem.used",  {"bytes",    {"host"}}},
+        {"mem.free",  {"bytes",    {"host"}}},
 
-        // Disk I/O (bytes/sec per spec; your sampler writes read/write per second)
-        {"disk.read_bytes", {"bytes/sec",{"host","dev"}}},
-        {"disk.write_bytes",{"bytes/sec",{"host","dev"}}},
-        {"disk.util_pct",   {"%",        {"host","dev"}}}, // optional
+        {"disk.read", {"bytes/sec",{"host","dev"}}},
+        {"disk.write",{"bytes/sec",{"host","dev"}}},
 
         // Network (bytes/sec per spec)
-        {"net.rx_bytes",    {"bytes/sec",{"host","iface"}}},
-        {"net.tx_bytes",    {"bytes/sec",{"host","iface"}}},
+        {"net.rx",    {"bytes/sec",{"host","iface"}}},
+        {"net.tx",    {"bytes/sec",{"host","iface"}}},
 
-        // Processes (summary) — timeseries only for count; top is table via another route later
-        {"proc.count",      {"count",    {"host"}}}
 };
 
 // Allowed label universe (guardrail)
@@ -183,6 +179,24 @@ static void write_csv(httplib::Response& res,
 void bind_routes(httplib::Server& svr, MemoryStore& store) {
     set_cors(svr);
 
+
+    svr.Get("/api/info", [&](const httplib::Request& req, httplib::Response& res) {
+        const std::string key = req.get_param_value("key");
+
+        // Case 1: no key -> return all metadata
+        if (key.empty()) {
+            return write_json(res, store.all_metadata());
+        }
+
+        // Case 2: key provided -> return metadata[key]
+        json data = store.get_metadata(key);
+        if (data.is_null() || data.empty()) {
+            return write_error(res, 400, "No key found");
+        }
+
+        return write_json(res, data);
+    });
+
     // /api/status
     svr.Get("/api/status", [&store](const httplib::Request&, httplib::Response& res){
         const auto uptime_s =
@@ -213,74 +227,177 @@ void bind_routes(httplib::Server& svr, MemoryStore& store) {
         write_json(res, json{{"metrics", arr}});
     });
 
-    // /api/presets — as spec
-    svr.Get("/api/presets", [](const httplib::Request&, httplib::Response& res){
+
+    // /api/stored — enumerate all stored metrics and the observed label values
+    svr.Get("/api/stored", [&store](const httplib::Request&, httplib::Response& res) {
+
+        using json = nlohmann::json;
+
+        // ---- Helper: parse "metric{key=val,key2=val2}" ----
+        struct Parts {
+            std::string metric;
+            std::unordered_map<std::string, std::string> labels;
+        };
+
+        auto parse_selector = [&](const std::string& sel) -> Parts {
+            Parts p;
+
+            auto brace = sel.find('{');
+            if (brace == std::string::npos) {
+                p.metric = sel;
+                return p;
+            }
+
+            p.metric = sel.substr(0, brace);
+
+            auto close = sel.find('}', brace);
+            if (close == std::string::npos) return p;
+
+            std::string inside = sel.substr(brace + 1, close - brace - 1);
+            std::istringstream ss(inside);
+            std::string kv;
+
+            while (std::getline(ss, kv, ',')) {
+                auto pos = kv.find('=');
+                if (pos == std::string::npos) continue;
+                std::string k = kv.substr(0, pos);
+                std::string v = kv.substr(pos + 1);
+                p.labels[k] = v;
+            }
+
+            return p;
+        };
+
+        // -----------------------------
+        // 1) Get all stored selectors
+        // -----------------------------
+        std::vector<std::string> selectors = store.list_series_keys();
+
+        // maps metric → (label → set<label-values>)
+        std::unordered_map<std::string,
+                std::unordered_map<std::string, std::unordered_set<std::string>>
+        > agg;
+
+        // also track whether the metric is stored as vector or scalar
+        std::unordered_map<std::string, std::string> metric_kind;
+
+        for (const auto& sel : selectors) {
+            Parts p = parse_selector(sel);
+            if (p.metric.empty()) continue;
+
+            // detect kind by naming convention
+            // scalar: single-value metrics
+            // vector: multi-value metrics (like "cpu.core_pct")
+            if (p.metric == "cpu.core_pct") {
+                metric_kind[p.metric] = "vector";
+            } else {
+                metric_kind[p.metric] = "scalar";
+            }
+
+            auto& label_map = agg[p.metric];
+
+            for (const auto& [k, v] : p.labels) {
+                label_map[k].insert(v);
+            }
+        }
+
+        // -----------------------------
+        // 2) Build JSON output
+        // -----------------------------
+        json out_metrics = json::array();
+
+        for (const auto& [metric, labels_map] : agg) {
+
+            json label_obj = json::object();
+            for (const auto& [label_key, value_set] : labels_map) {
+                std::vector<std::string> vals(value_set.begin(), value_set.end());
+                std::sort(vals.begin(), vals.end());
+                label_obj[label_key] = vals;
+            }
+
+            // unit inference by simple naming convention
+            std::string unit;
+            if (metric.find("pct") != std::string::npos)       unit = "%";
+            else if (metric.find("bytes") != std::string::npos) unit = "bytes";
+            else                                                unit = "value";
+
+            out_metrics.push_back({
+                                          {"name",  metric},
+                                          {"kind",  metric_kind[metric]},
+                                          {"unit",  unit},
+                                          {"labels", label_obj}
+                                  });
+        }
+
+        // sort metrics alphabetically for stable output
+        std::sort(out_metrics.begin(), out_metrics.end(),
+                  [](const json& a, const json& b){
+                      return a["name"].get<std::string>() < b["name"].get<std::string>();
+                  });
+
         write_json(res, json{
-                {"presets", json::array({
-                                                json{{"name","15m"},{"seconds",900}},
-                                                json{{"name","1h"},{"seconds",3600}},
-                                                json{{"name","24h"},{"seconds",86400}}
-                                        })}
+                {"metrics", out_metrics}
         });
     });
 
-    // /api/timeseries
-    svr.Get("/api/timeseries", [&store](const httplib::Request& req, httplib::Response& res){
+
+
+    // /api/query
+    svr.Get("/api/query", [&store](const httplib::Request& req, httplib::Response& res) {
         const std::string metric_name = req.get_param_value("metric");
-        const std::string from_str    = req.get_param_value("from");
-        const std::string to_str      = req.get_param_value("to");
-
         if (metric_name.empty())
-            return write_error(res, 400, "Missing required parameter 'metric'");
-        if (from_str.empty())
-            return write_error(res, 400, "Missing required parameter 'from'");
-        if (to_str.empty())
-            return write_error(res, 400, "Missing required parameter 'to'");
+            return write_error(res, 400, "Missing ?metric");
 
-        const auto from_ms = parse_ll(from_str);
-        const auto to_ms   = parse_ll(to_str);
-        if (!from_ms.has_value() || !to_ms.has_value())
-            return write_error(res, 400, "Parameters 'from' and 'to' must be epoch milliseconds (integers)");
-        if (*from_ms > *to_ms)
-            return write_error(res, 400, "'from' must be <= 'to'");
+        // Parse optional params
+        const auto from_opt = parse_ll(req.get_param_value("from"));
+        const auto to_opt   = parse_ll(req.get_param_value("to"));
+        long long from_ms = from_opt.value_or(0);
+        long long to_ms   = to_opt.value_or(std::numeric_limits<long long>::max());
 
-        // labels (key:value,...) + default host
         auto labels = parse_label_filters(req.get_param_value("labels"));
         if (labels.find("host") == labels.end() && !cfg::HOST_LABEL.empty())
             labels.emplace("host", cfg::HOST_LABEL);
 
-        // validate metric + labels against registry
+        // Validate against registry
         std::string err;
-        if (!validate_metric_and_labels(metric_name, labels, err)) {
+        if (!validate_metric_and_labels(metric_name, labels, err))
             return write_error(res, 422, err);
-        }
-
-        // optional echo-throughs
-        const std::string rollup = req.has_param("rollup") ? req.get_param_value("rollup") : "raw";
-        const auto step_opt  = parse_ll(req.get_param_value("step"));   // seconds; not applied in v0
-        const auto limit_opt = parse_ll(req.get_param_value("limit"));
-        const long long limit = (limit_opt && *limit_opt > 0) ? *limit_opt : 10000;
 
         const auto selector = build_selector(metric_name, labels);
 
-        std::vector<Sample> data = store.query(selector, *from_ms, *to_ms); // raw only in v0
-        if (static_cast<long long>(data.size()) > limit) {
-            data.erase(data.begin(), data.end() - static_cast<size_t>(limit));
-        }
+        // detect vector metric by checking if it exists in vec store
+        bool is_vector = store.vec_series_exists(selector);
 
         json samples = json::array();
-        for (const auto& s : data) samples.push_back({s.ts_ms, s.value});
+
+        if (is_vector) {
+            auto rows = store.query_vector(selector, from_ms, to_ms);
+            for (auto &r : rows)
+                samples.push_back({ r.ts_ms, r.vals });
+        } else {
+            auto rows = store.query(selector, from_ms, to_ms);
+            for (auto &r : rows)
+                samples.push_back({ r.ts_ms, r.value });
+        }
 
         json labels_json = json::object();
-        for (const auto& [k, v] : labels) labels_json[k] = v;
+        for (auto &[k,v] : labels) labels_json[k] = v;
+
 
         write_json(res, json{
-                {"metric",  metric_name},
-                {"unit",    unit_for_metric(metric_name)},
-                {"rollup",  rollup},
-                {"labels",  labels_json},
-                {"samples", samples}
+                {"metric", metric_name},
+                {"unit",   unit_for_metric(metric_name)},
+                {"labels", labels_json},
+                {"samples", samples},
+                {"vector", is_vector}
         });
+    });
+
+    // in your route binder
+    svr.Get("/api/processes", [&store](const httplib::Request&, httplib::Response& res){
+        nlohmann::json j = store.get_snapshot("processes");
+        if (j.is_null()) j = nlohmann::json::array();
+        write_json(res, j);
     });
 
     // /api/export — same query params as /timeseries + format

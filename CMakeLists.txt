@@ -6,7 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 include_directories(${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
 
 # Pick collectors by OS
-set(COLLECTOR_SRCS collector/loop.cpp)
+set(COLLECTOR_SRCS collector/loop.cpp
+        collector/proc_linux.cpp)
 if(APPLE)
     list(APPEND COLLECTOR_SRCS
             collector/cpu_macos.cpp
@@ -20,12 +21,14 @@ else() # Linux
             collector/memory_linux.cpp
             collector/disk_linux.cpp
             collector/net_linux.cpp
+            collector/proc_linux.cpp
     )
 endif()
 
 add_executable(dashboard
         main.cpp
-        api/status_server.cpp
+        api/routes.cpp
         store/memory_store.cpp
+        store/system_info.cpp
         ${COLLECTOR_SRCS}
 )

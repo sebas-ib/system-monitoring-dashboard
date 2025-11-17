@@ -8,7 +8,7 @@
 #pragma once
 #include <cstdint>
 
-struct MemBytes { uint64_t used_bytes=0, free_bytes=0; }; // free = available
+struct MemBytes { uint64_t used_bytes=0, free_bytes=0, total_bytes=0;}; // free = available
 
 bool get_system_memory_bytes(MemBytes& mb);
 
