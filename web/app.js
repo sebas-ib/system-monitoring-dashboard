@@ -254,7 +254,7 @@ async function loadAndRenderCores(){
         to: Date.now()
     });
 
-    if (!info.vector) return;  // safety
+    if (!info.vector) return;
 
     const samples = info.samples || [];
     if (!samples.length) return;

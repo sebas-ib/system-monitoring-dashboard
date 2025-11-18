@@ -1,95 +1,172 @@
-//
-// Created by Sebastian Ibarra on 10/9/25.
-//
+// loop.cpp — orchestrates the background sampler that collects host metrics.
+// The sampler loops forever while 'running' stays true and populates MemoryStore
+// with CPU, memory, disk, network, and process data for the HTTP API layer.
 
 #include <atomic>
 #include <thread>
 #include <vector>
+
 #include "collector/loop.h"
+
 #include "collector/cpu.h"
+#include "collector/disk.h"
 #include "collector/memory.h"
 #include "collector/net.h"
+#include "collector/proc.h"
+#include "config.h"
 #include "metrics/metric_key.h"
 #include "metrics/time.h"
-#include "config.h"
-#include "collector/disk.h"
-#include <iostream>
-
-#include "collector/proc.h"
 #include "third_party/json.hpp"
 
-using json   = nlohmann::json;
+namespace {
+using json = nlohmann::json;
 
+constexpr size_t kProcessTableLimit = 128;
 
+std::string selector_for(const std::string& metric_name,
+                         const std::initializer_list<std::pair<std::string, std::string>>& labels) {
+    return metric_with_labels(metric_name, labels);
+}
+
+void sample_cpu_metrics(MemoryStore& store, int64_t timestamp_ms, std::vector<double>& core_percent_buffer) {
+    const std::string total_cpu_selector = selector_for("cpu.total_pct", {{"host", cfg::HOST_LABEL}});
+    if (double total_percent = get_cpu_total_percent(); total_percent >= 0.0) {
+        store.append(total_cpu_selector, timestamp_ms, total_percent);
+    }
+
+    const std::string core_cpu_selector = selector_for("cpu.core_pct", {{"host", cfg::HOST_LABEL}});
+    if (get_cpu_core_percent(core_percent_buffer)) {
+        store.append_vector(core_cpu_selector, timestamp_ms, core_percent_buffer);
+    }
+}
+
+void sample_memory_metrics(MemoryStore& store, int64_t timestamp_ms) {
+    if (MemBytes bytes; get_system_memory_bytes(bytes)) {
+        const std::string used_selector = selector_for("mem.used", {{"host", cfg::HOST_LABEL}});
+        store.append(used_selector, timestamp_ms, static_cast<double>(bytes.used_bytes));
+
+        const std::string free_selector = selector_for("mem.free", {{"host", cfg::HOST_LABEL}});
+        store.append(free_selector, timestamp_ms, static_cast<double>(bytes.free_bytes));
+    }
+}
+
+void sample_disk_metrics(MemoryStore& store, int64_t timestamp_ms, std::vector<DiskIO>& disk_io_buffer) {
+    if (!get_disk_io(disk_io_buffer)) {
+        return;
+    }
+
+    for (const DiskIO& device_io : disk_io_buffer) {
+        const std::string read_selector = selector_for("disk.read", {
+                {"host", cfg::HOST_LABEL},
+                {"dev", device_io.dev_name}
+        });
+        store.append(read_selector, timestamp_ms, device_io.bytes_read_per_s);
+
+        const std::string write_selector = selector_for("disk.write", {
+                {"host", cfg::HOST_LABEL},
+                {"dev", device_io.dev_name}
+        });
+        store.append(write_selector, timestamp_ms, device_io.bytes_written_per_s);
+    }
+}
+
+void sample_network_metrics(MemoryStore& store,
+                            int64_t timestamp_ms,
+                            std::unordered_map<std::string, InterfaceRates>& interface_rates) {
+    if (!get_net_stats(interface_rates)) {
+        return;
+    }
+
+    for (const auto& [interface, rate] : interface_rates) {
+        const std::string rx_selector = selector_for("net.rx", {
+                {"host", cfg::HOST_LABEL},
+                {"iface", interface}
+        });
+        store.append(rx_selector, timestamp_ms, rate.rx_bytes_per_s);
+
+        const std::string tx_selector = selector_for("net.tx", {
+                {"host", cfg::HOST_LABEL},
+                {"iface", interface}
+        });
+        store.append(tx_selector, timestamp_ms, rate.tx_bytes_per_s);
+    }
+}
+
+json serialize_process_rows(const std::vector<procmon::ProcRow>& rows) {
+    json::array_t table;
+    table.reserve(rows.size());
+
+    for (const auto& row : rows) {
+        table.push_back(json{
+                {"pid", row.pid},
+                {"ppid", row.ppid},
+                {"user", row.user},
+                {"name", row.name},
+                {"state", std::string(1, row.state)},
+                {"cpu_pct", row.cpu_pct},
+                {"cpu_time_s", row.cpu_time_s},
+                {"threads", row.threads},
+                {"idle_wakeups_per_s", row.wakeups_per_s},
+                {"rss_mb", row.rss_mb},
+                {"mem_pct", row.mem_pct},
+                {"priority", row.priority},
+                {"nice", row.nice}
+        });
+    }
+
+    return table;
+}
+
+void sample_process_metrics(MemoryStore& store,
+                            procmon::ProcSnapshot& previous_snapshot,
+                            procmon::ProcSnapshot& current_snapshot,
+                            bool& have_previous_snapshot) {
+    if (!procmon::read_proc_snapshot(current_snapshot)) {
+        return;
+    }
+
+    if (have_previous_snapshot) {
+        const auto rows = procmon::top_by_cpu(previous_snapshot, current_snapshot, kProcessTableLimit);
+        store.put_snapshot("processes", serialize_process_rows(rows));
+    }
+
+    previous_snapshot = std::move(current_snapshot);
+    have_previous_snapshot = true;
+}
+} // namespace
+
+/**
+ * Launch the detached sampler loop.
+ *
+ * @param store   Shared MemoryStore receiving metrics.
+ * @param running Flag toggled by the caller to stop sampling.
+ * @return Joinable std::thread that runs the sampler loop.
+ */
 std::thread start_sampler(MemoryStore& store, std::atomic<bool>& running) {
     return std::thread([&store, &running]() {
-        std::vector<double> core_pct;
-        std::vector<DiskIO> disk_ios;
-        std::unordered_map<std::string, InterfaceRates> rates;
+        std::vector<double> core_percent_buffer;
+        std::vector<DiskIO> disk_io_buffer;
+        std::unordered_map<std::string, InterfaceRates> interface_rates;
 
-        procmon::ProcSnapshot prev_proc{}, cur_proc{};
-        bool have_prev_proc = false;
+        procmon::ProcSnapshot previous_process_snapshot{};
+        procmon::ProcSnapshot current_process_snapshot{};
+        bool have_previous_process_snapshot = false;
 
         while (running.load(std::memory_order_relaxed)) {
-            auto t = now_ms();
+            const int64_t timestamp_ms = now_ms();
 
-            if (double total = get_cpu_total_percent(); total >= 0.0) {
-                store.append(metric_with_labels("cpu.total_pct", {{"host", cfg::HOST_LABEL}}), t, total);
-            }
+            sample_cpu_metrics(store, timestamp_ms, core_percent_buffer);
 
-            if (get_cpu_core_percent(core_pct)) {
-                    store.append_vector(metric_with_labels("cpu.core_pct",{{"host", cfg::HOST_LABEL}}), t, core_pct);
-            }
+            sample_memory_metrics(store, timestamp_ms);
 
-            if (MemBytes mb; get_system_memory_bytes(mb)) {
-                store.append(metric_with_labels("mem.used", {{"host", cfg::HOST_LABEL}}), t, (double)mb.used_bytes);
-                store.append(metric_with_labels("mem.free", {{"host", cfg::HOST_LABEL}}), t, (double)mb.free_bytes);
-            }
+            sample_disk_metrics(store, timestamp_ms, disk_io_buffer);
 
-            if (get_disk_io(disk_ios)) {
-                for (const DiskIO& io : disk_ios) {
-                    store.append(metric_with_labels("disk.read",  {{"host", cfg::HOST_LABEL}, {"dev", io.dev_name}}), t, io.bytes_read_per_s);
-                    store.append(metric_with_labels("disk.write", {{"host", cfg::HOST_LABEL}, {"dev", io.dev_name}}), t, io.bytes_written_per_s);
-                }
-            }
+            sample_network_metrics(store, timestamp_ms, interface_rates);
 
-            if (get_net_stats(rates)) {
-                for (const auto& [iface, rate] : rates) {
-                    store.append(metric_with_labels("net.rx", {{"host", cfg::HOST_LABEL}, {"iface", iface}}), t, rate.rx_bytes_per_s);
-                    store.append(metric_with_labels("net.tx", {{"host", cfg::HOST_LABEL}, {"iface", iface}}), t, rate.tx_bytes_per_s);
-                }
-            }
-
-            if (procmon::read_proc_snapshot(cur_proc)) {
-                if (have_prev_proc) {
-                    auto rows = procmon::top_by_cpu(prev_proc, cur_proc, /*limit*/ 128); // or 0 for all
-
-                    nlohmann::json::array_t arr;
-                    arr.reserve(rows.size());
-
-                    for (const auto& r : rows) {
-                        arr.push_back(nlohmann::json{
-                                {"pid", r.pid},
-                                {"ppid", r.ppid},
-                                {"user", r.user},
-                                {"name", r.name},
-                                {"state", std::string(1, r.state)},
-                                {"cpu_pct", r.cpu_pct},
-                                {"cpu_time_s", r.cpu_time_s},
-                                {"threads", r.threads},
-                                {"idle_wakeups_per_s", r.wakeups_per_s},
-                                {"rss_mb", r.rss_mb},
-                                {"mem_pct", r.mem_pct},
-                                {"priority", r.priority},
-                                {"nice", r.nice}
-                        });
-                    }
-                    nlohmann::json table = std::move(arr);
-                    store.put_snapshot("processes", table);
-                }
-                prev_proc = std::move(cur_proc);
-                have_prev_proc = true;
-            }
+            sample_process_metrics(store,
+                                   previous_process_snapshot,
+                                   current_process_snapshot,
+                                   have_previous_process_snapshot);
 
             std::this_thread::sleep_for(std::chrono::seconds(cfg::SAMPLE_PERIOD_S));
         }

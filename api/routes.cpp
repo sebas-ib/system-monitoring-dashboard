@@ -1,13 +1,15 @@
-//
-// routes.cpp — API aligned with Metrics Spec (v0)
-//
+// routes.cpp — HTTP API bindings for the monitoring dashboard.
+// Exposes JSON/CSV endpoints that surface metrics collected in MemoryStore.
+
 #include "routes.h"
-#include "third_party/httplib.h"
-#include "third_party/json.hpp"
+
 #include "config.h"
 #include "metrics/metric_key.h"
 #include "store/memory_store.h"
+#include "third_party/httplib.h"
+#include "third_party/json.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -18,139 +20,175 @@
 #include <unordered_set>
 #include <vector>
 
-using json   = nlohmann::json;
-using Clock  = std::chrono::steady_clock;
-
-// ----------------------------- registry -------------------------------------
+namespace {
+using json = nlohmann::json;
+using Clock = std::chrono::steady_clock;
 
 struct MetricDesc {
-    const char* unit;                       // required unit
-    std::vector<std::string> labels;        // allowed labels for this metric
+    const char* unit;
+    std::vector<std::string> labels;
 };
 
-// Core Metrics (v0) — exactly as in your spec
-static const std::unordered_map<std::string, MetricDesc> kRegistry = {
-        // CPU
-        {"cpu.total_pct",   {"%",        {"host"}}},
-        {"cpu.core_pct",    {"%",        {"host","core"}}},
-
-        // Memory
-        {"mem.used",  {"bytes",    {"host"}}},
-        {"mem.free",  {"bytes",    {"host"}}},
-
-        {"disk.read", {"bytes/sec",{"host","dev"}}},
-        {"disk.write",{"bytes/sec",{"host","dev"}}},
-
-        // Network (bytes/sec per spec)
-        {"net.rx",    {"bytes/sec",{"host","iface"}}},
-        {"net.tx",    {"bytes/sec",{"host","iface"}}},
-
+struct MetricSelectorParts {
+    std::string metric;
+    std::unordered_map<std::string, std::string> labels;
 };
 
-// Allowed label universe (guardrail)
-static const std::unordered_set<std::string> kAllowedLabelUniverse = {
-        "host","core","dev","iface","pid","comm"
+const std::unordered_map<std::string, MetricDesc> kMetricRegistry = {
+        {"cpu.total_pct", {"%", {"host"}}},
+        {"cpu.core_pct", {"%", {"host", "core"}}},
+        {"mem.used", {"bytes", {"host"}}},
+        {"mem.free", {"bytes", {"host"}}},
+        {"disk.read", {"bytes/sec", {"host", "dev"}}},
+        {"disk.write", {"bytes/sec", {"host", "dev"}}},
+        {"net.rx", {"bytes/sec", {"host", "iface"}}},
+        {"net.tx", {"bytes/sec", {"host", "iface"}}},
 };
 
-// ----------------------------- helpers --------------------------------------
+const std::unordered_set<std::string> kPermittedLabelUniverse = {
+        "host", "core", "dev", "iface", "pid", "comm"
+};
 
-static const auto kStartedAt = Clock::now();
+const auto kStartedAt = Clock::now();
 
-static void set_cors(httplib::Server& svr) {
-    svr.set_default_headers({
-                                    {"Access-Control-Allow-Origin",  "*"},
-                                    {"Access-Control-Allow-Methods", "GET, OPTIONS"},
-                                    {"Access-Control-Allow-Headers", "Content-Type"}
-                            });
-    svr.Options(R"(/.*)", [](const httplib::Request&, httplib::Response& res){
+/**
+ * Configure permissive CORS headers so that the dashboard UI can query the API
+ * directly from any origin.
+ */
+void configure_cors(httplib::Server& server) {
+    server.set_default_headers({
+            {"Access-Control-Allow-Origin", "*"},
+            {"Access-Control-Allow-Methods", "GET, OPTIONS"},
+            {"Access-Control-Allow-Headers", "Content-Type"}
+    });
+    server.Options(R"(/.*)", [](const httplib::Request&, httplib::Response& res) {
         res.status = 204;
     });
 }
 
-static void write_json(httplib::Response& res, const json& j, int status=200) {
+/**
+ * Serialize JSON and status code into the outgoing response.
+ */
+void write_json_response(httplib::Response& res, const json& payload, int status = 200) {
     res.status = status;
-    res.set_content(j.dump(), "application/json");
+    res.set_content(payload.dump(), "application/json");
 }
 
-static void write_error(httplib::Response& res, int code, std::string msg) {
-    write_json(res, json{
-            {"error", {{"code", code}, {"message", std::move(msg)}}}
-    }, code);
+/**
+ * Emit a uniform error structure ({"error": {code, message}}).
+ */
+void write_error_response(httplib::Response& res, int status, std::string message) {
+    write_json_response(res, json{{"error", {{"code", status}, {"message", std::move(message)}}}}, status);
 }
 
-static std::optional<long long> parse_ll(const std::string& s) {
-    if (s.empty()) return std::nullopt;
+/**
+ * Parse stringified integers (base 10). Returns nullopt on failure.
+ */
+std::optional<long long> parse_int64(const std::string& candidate) {
+    if (candidate.empty()) {
+        return std::nullopt;
+    }
+
     char* end = nullptr;
     errno = 0;
-    long long v = std::strtoll(s.c_str(), &end, 10);
-    if (errno != 0 || end == s.c_str() || *end != '\0') return std::nullopt;
-    return v;
-}
-
-static std::unordered_map<std::string, std::string>
-parse_label_filters(const std::string& s) {
-    // key:value,key2:value2
-    std::unordered_map<std::string, std::string> out;
-    if (s.empty()) return out;
-    std::istringstream ss(s);
-    std::string kv;
-    while (std::getline(ss, kv, ',')) {
-        auto pos = kv.find(':');
-        if (pos == std::string::npos) continue;
-        std::string k = kv.substr(0, pos);
-        std::string v = kv.substr(pos + 1);
-        if (!k.empty() && !v.empty()) out.emplace(std::move(k), std::move(v));
+    const long long value = std::strtoll(candidate.c_str(), &end, 10);
+    if (errno != 0 || end == candidate.c_str() || *end != '\0') {
+        return std::nullopt;
     }
-    return out;
+    return value;
 }
 
-static std::string build_selector(const std::string& name,
-                                  const std::unordered_map<std::string, std::string>& labels) {
-    if (labels.empty()) return name;
-    std::ostringstream os;
-    os << name << "{";
+/**
+ * Parse `key:value,key2:value2` label filters used by query/export endpoints.
+ */
+std::unordered_map<std::string, std::string> parse_label_filters(const std::string& encoded) {
+    std::unordered_map<std::string, std::string> labels;
+    if (encoded.empty()) {
+        return labels;
+    }
+
+    std::istringstream encoded_stream(encoded);
+    std::string token;
+    while (std::getline(encoded_stream, token, ',')) {
+        const auto separator = token.find(':');
+        if (separator == std::string::npos) {
+            continue;
+        }
+
+        std::string key = token.substr(0, separator);
+        std::string value = token.substr(separator + 1);
+        if (!key.empty() && !value.empty()) {
+            labels.emplace(std::move(key), std::move(value));
+        }
+    }
+
+    return labels;
+}
+
+/**
+ * Render the fully-qualified selector `metric{label=value}` used as the
+ * MemoryStore key.
+ */
+std::string build_selector(const std::string& metric_name,
+                           const std::unordered_map<std::string, std::string>& labels) {
+    if (labels.empty()) {
+        return metric_name;
+    }
+
+    std::ostringstream selector;
+    selector << metric_name << "{";
     bool first = true;
-    for (const auto& [k, v] : labels) {
-        if (!first) os << ",";
+    for (const auto& [key, value] : labels) {
+        if (!first) {
+            selector << ",";
+        }
         first = false;
-        os << k << "=" << v;
+        selector << key << "=" << value;
     }
-    os << "}";
-    return os.str();
+    selector << "}";
+    return selector.str();
 }
 
-static bool validate_metric_and_labels(const std::string& metric_name,
-                                       const std::unordered_map<std::string, std::string>& labels,
-                                       std::string& err_msg) {
-    auto it = kRegistry.find(metric_name);
-    if (it == kRegistry.end()) {
-        err_msg = "Unknown metric '" + metric_name + "'";
+/**
+ * Validate that the requested metric exists and supplied labels are allowed.
+ */
+bool validate_metric_and_labels(const std::string& metric_name,
+                                const std::unordered_map<std::string, std::string>& labels,
+                                std::string& error_message) {
+    const auto registry_it = kMetricRegistry.find(metric_name);
+    if (registry_it == kMetricRegistry.end()) {
+        error_message = "Unknown metric '" + metric_name + "'";
         return false;
     }
-    const auto& allowed = it->second.labels;
 
-    // 1) ensure keys are in allowed list for this metric
-    const std::unordered_set<std::string> allowed_set(allowed.begin(), allowed.end());
-    for (const auto& [k, _] : labels) {
-        if (!allowed_set.count(k)) {
-            err_msg = "Label '" + k + "' not allowed for metric '" + metric_name + "'";
+    const std::unordered_set<std::string> allowed_labels(registry_it->second.labels.begin(),
+                                                         registry_it->second.labels.end());
+    for (const auto& [label_key, _] : labels) {
+        if (!allowed_labels.count(label_key)) {
+            error_message = "Label '" + label_key + "' not allowed for metric '" + metric_name + "'";
             return false;
         }
-        if (!kAllowedLabelUniverse.count(k)) {
-            err_msg = "Label '" + k + "' is not in the global allowed label set";
+        if (!kPermittedLabelUniverse.count(label_key)) {
+            error_message = "Label '" + label_key + "' is not in the allowed label universe";
             return false;
         }
     }
+
     return true;
 }
 
-static const char* unit_for_metric(const std::string& metric_name) {
-    auto it = kRegistry.find(metric_name);
-    if (it != kRegistry.end()) return it->second.unit;
-    // Fallback (shouldn’t happen if validation is on the happy path)
-    if (metric_name.find("pct") != std::string::npos) return "%";
+/**
+ * Determine the preferred unit string for a metric name.
+ */
+const char* infer_unit_for_metric(const std::string& metric_name) {
+    if (const auto registry_it = kMetricRegistry.find(metric_name); registry_it != kMetricRegistry.end()) {
+        return registry_it->second.unit;
+    }
+
+    if (metric_name.find("pct") != std::string::npos) {
+        return "%";
+    }
     if (metric_name.find("bytes") != std::string::npos) {
-        // Prefer /sec when ambiguous (disk/net names in v0 are bytes/sec)
         if (metric_name.find("read") != std::string::npos ||
             metric_name.find("write") != std::string::npos ||
             metric_name.find("rx") != std::string::npos ||
@@ -159,304 +197,287 @@ static const char* unit_for_metric(const std::string& metric_name) {
         }
         return "bytes";
     }
-    if (metric_name.find("count") != std::string::npos) return "count";
+    if (metric_name.find("count") != std::string::npos) {
+        return "count";
+    }
     return "value";
 }
 
-static void write_csv(httplib::Response& res,
-                      const std::vector<Sample>& data,
-                      const std::string& filename = "export.csv") {
-    std::ostringstream os;
-    os << "timestamp,value\n";
-    for (const auto& s : data) os << s.ts_ms << "," << s.value << "\n";
+/**
+ * Export samples to CSV, matching the column order expected by the UI.
+ */
+void write_csv_response(httplib::Response& res,
+                        const std::vector<Sample>& samples,
+                        const std::string& filename = "export.csv") {
+    std::ostringstream csv;
+    csv << "timestamp,value\n";
+    for (const auto& sample : samples) {
+        csv << sample.ts_ms << "," << sample.value << "\n";
+    }
     res.status = 200;
-    res.set_content(os.str(), "text/csv");
+    res.set_content(csv.str(), "text/csv");
     res.set_header("Content-Disposition", ("attachment; filename=\"" + filename + "\"").c_str());
 }
 
+/**
+ * Parse selectors such as `metric{key=value}` from stored series keys.
+ */
+MetricSelectorParts parse_selector(const std::string& selector) {
+    MetricSelectorParts parts;
+
+    const auto open_brace = selector.find('{');
+    if (open_brace == std::string::npos) {
+        parts.metric = selector;
+        return parts;
+    }
+
+    parts.metric = selector.substr(0, open_brace);
+    const auto close_brace = selector.find('}', open_brace);
+    if (close_brace == std::string::npos) {
+        return parts;
+    }
+
+    std::string inside = selector.substr(open_brace + 1, close_brace - open_brace - 1);
+    std::istringstream inside_stream(inside);
+    std::string token;
+    while (std::getline(inside_stream, token, ',')) {
+        const auto equals = token.find('=');
+        if (equals == std::string::npos) {
+            continue;
+        }
+
+        std::string key = token.substr(0, equals);
+        std::string value = token.substr(equals + 1);
+        parts.labels[key] = value;
+    }
+
+    return parts;
+}
+
+/**
+ * Convert metric selectors stored in MemoryStore into a user-friendly summary.
+ */
+json describe_stored_metrics(const MemoryStore& store) {
+    const std::vector<std::string> selectors = store.list_series_keys();
+
+    std::unordered_map<std::string, std::unordered_map<std::string, std::unordered_set<std::string>>> values_by_metric;
+    std::unordered_map<std::string, std::string> metric_kind;
+
+    for (const auto& selector : selectors) {
+        MetricSelectorParts parts = parse_selector(selector);
+        if (parts.metric.empty()) {
+            continue;
+        }
+
+        metric_kind[parts.metric] = (parts.metric == "cpu.core_pct") ? "vector" : "scalar";
+        auto& label_map = values_by_metric[parts.metric];
+        for (const auto& [label_key, label_value] : parts.labels) {
+            label_map[label_key].insert(label_value);
+        }
+    }
+
+    json metrics_array = json::array();
+    for (const auto& [metric, labels_map] : values_by_metric) {
+        json label_values = json::object();
+        for (const auto& [label_key, value_set] : labels_map) {
+            std::vector<std::string> values(value_set.begin(), value_set.end());
+            std::sort(values.begin(), values.end());
+            label_values[label_key] = values;
+        }
+
+        std::string unit;
+        if (metric.find("pct") != std::string::npos) {
+            unit = "%";
+        } else if (metric.find("bytes") != std::string::npos) {
+            unit = "bytes";
+        } else {
+            unit = "value";
+        }
+
+        metrics_array.push_back({
+                {"name", metric},
+                {"kind", metric_kind[metric]},
+                {"unit", unit},
+                {"labels", label_values}
+        });
+    }
+
+    std::sort(metrics_array.begin(), metrics_array.end(), [](const json& lhs, const json& rhs) {
+        return lhs["name"].get<std::string>() < rhs["name"].get<std::string>();
+    });
+
+    return json{{"metrics", metrics_array}};
+}
+
+/**
+ * Convert label map to JSON object for responses.
+ */
+json labels_to_json(const std::unordered_map<std::string, std::string>& labels) {
+    json labels_json = json::object();
+    for (const auto& [key, value] : labels) {
+        labels_json[key] = value;
+    }
+    return labels_json;
+}
+} // namespace
+
 // ------------------------------- routes -------------------------------------
 
+/**
+ * Bind all HTTP routes exposed by the monitoring API.
+ */
 void bind_routes(httplib::Server& svr, MemoryStore& store) {
-    set_cors(svr);
+    configure_cors(svr);
 
-
-    svr.Get("/api/info", [&](const httplib::Request& req, httplib::Response& res) {
+    svr.Get("/api/info", [&store](const httplib::Request& req, httplib::Response& res) {
         const std::string key = req.get_param_value("key");
-
-        // Case 1: no key -> return all metadata
         if (key.empty()) {
-            return write_json(res, store.all_metadata());
+            return write_json_response(res, store.all_metadata());
         }
 
-        // Case 2: key provided -> return metadata[key]
-        json data = store.get_metadata(key);
+        const json data = store.get_metadata(key);
         if (data.is_null() || data.empty()) {
-            return write_error(res, 400, "No key found");
+            return write_error_response(res, 400, "No key found");
         }
-
-        return write_json(res, data);
+        return write_json_response(res, data);
     });
 
-    // /api/status
-    svr.Get("/api/status", [&store](const httplib::Request&, httplib::Response& res){
-        const auto uptime_s =
+    svr.Get("/api/status", [&store](const httplib::Request&, httplib::Response& res) {
+        const auto uptime_seconds =
                 std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - kStartedAt).count();
 
-        // If you don’t have these methods yet, stub to 0 / 0.0 or remove.
-        json j{
-                {"status", "ok"},
-                {"uptime_s", uptime_s},
-                {"metrics_collected", 0}, // implement or stub
-                {"store_size_mb", 0}           // implement or stub
-        };
-        write_json(res, j);
+        json payload{{"status", "ok"},
+                     {"uptime_s", uptime_seconds},
+                     {"metrics_collected", 0},
+                     {"store_size_mb", 0}};
+        write_json_response(res, payload);
     });
 
-    // /api/metrics — derived from the registry
-    svr.Get("/api/metrics", [](const httplib::Request&, httplib::Response& res){
-        json arr = json::array();
-        for (const auto& [name, desc] : kRegistry) {
-            json labels = json::array();
-            for (const auto& l : desc.labels) labels.push_back(l);
-            arr.push_back({
-                                  {"name",   name},
-                                  {"unit",   desc.unit},
-                                  {"labels", labels}
-                          });
+    svr.Get("/api/metrics", [](const httplib::Request&, httplib::Response& res) {
+        json registry_array = json::array();
+        for (const auto& [name, desc] : kMetricRegistry) {
+            json allowed_labels = json::array();
+            for (const auto& label : desc.labels) {
+                allowed_labels.push_back(label);
+            }
+            registry_array.push_back({
+                    {"name", name},
+                    {"unit", desc.unit},
+                    {"labels", allowed_labels}
+            });
         }
-        write_json(res, json{{"metrics", arr}});
+        write_json_response(res, json{{"metrics", registry_array}});
     });
 
-
-    // /api/stored — enumerate all stored metrics and the observed label values
     svr.Get("/api/stored", [&store](const httplib::Request&, httplib::Response& res) {
-
-        using json = nlohmann::json;
-
-        // ---- Helper: parse "metric{key=val,key2=val2}" ----
-        struct Parts {
-            std::string metric;
-            std::unordered_map<std::string, std::string> labels;
-        };
-
-        auto parse_selector = [&](const std::string& sel) -> Parts {
-            Parts p;
-
-            auto brace = sel.find('{');
-            if (brace == std::string::npos) {
-                p.metric = sel;
-                return p;
-            }
-
-            p.metric = sel.substr(0, brace);
-
-            auto close = sel.find('}', brace);
-            if (close == std::string::npos) return p;
-
-            std::string inside = sel.substr(brace + 1, close - brace - 1);
-            std::istringstream ss(inside);
-            std::string kv;
-
-            while (std::getline(ss, kv, ',')) {
-                auto pos = kv.find('=');
-                if (pos == std::string::npos) continue;
-                std::string k = kv.substr(0, pos);
-                std::string v = kv.substr(pos + 1);
-                p.labels[k] = v;
-            }
-
-            return p;
-        };
-
-        // -----------------------------
-        // 1) Get all stored selectors
-        // -----------------------------
-        std::vector<std::string> selectors = store.list_series_keys();
-
-        // maps metric → (label → set<label-values>)
-        std::unordered_map<std::string,
-                std::unordered_map<std::string, std::unordered_set<std::string>>
-        > agg;
-
-        // also track whether the metric is stored as vector or scalar
-        std::unordered_map<std::string, std::string> metric_kind;
-
-        for (const auto& sel : selectors) {
-            Parts p = parse_selector(sel);
-            if (p.metric.empty()) continue;
-
-            // detect kind by naming convention
-            // scalar: single-value metrics
-            // vector: multi-value metrics (like "cpu.core_pct")
-            if (p.metric == "cpu.core_pct") {
-                metric_kind[p.metric] = "vector";
-            } else {
-                metric_kind[p.metric] = "scalar";
-            }
-
-            auto& label_map = agg[p.metric];
-
-            for (const auto& [k, v] : p.labels) {
-                label_map[k].insert(v);
-            }
-        }
-
-        // -----------------------------
-        // 2) Build JSON output
-        // -----------------------------
-        json out_metrics = json::array();
-
-        for (const auto& [metric, labels_map] : agg) {
-
-            json label_obj = json::object();
-            for (const auto& [label_key, value_set] : labels_map) {
-                std::vector<std::string> vals(value_set.begin(), value_set.end());
-                std::sort(vals.begin(), vals.end());
-                label_obj[label_key] = vals;
-            }
-
-            // unit inference by simple naming convention
-            std::string unit;
-            if (metric.find("pct") != std::string::npos)       unit = "%";
-            else if (metric.find("bytes") != std::string::npos) unit = "bytes";
-            else                                                unit = "value";
-
-            out_metrics.push_back({
-                                          {"name",  metric},
-                                          {"kind",  metric_kind[metric]},
-                                          {"unit",  unit},
-                                          {"labels", label_obj}
-                                  });
-        }
-
-        // sort metrics alphabetically for stable output
-        std::sort(out_metrics.begin(), out_metrics.end(),
-                  [](const json& a, const json& b){
-                      return a["name"].get<std::string>() < b["name"].get<std::string>();
-                  });
-
-        write_json(res, json{
-                {"metrics", out_metrics}
-        });
+        write_json_response(res, describe_stored_metrics(store));
     });
 
-
-
-    // /api/query
     svr.Get("/api/query", [&store](const httplib::Request& req, httplib::Response& res) {
         const std::string metric_name = req.get_param_value("metric");
-        if (metric_name.empty())
-            return write_error(res, 400, "Missing ?metric");
+        if (metric_name.empty()) {
+            return write_error_response(res, 400, "Missing ?metric");
+        }
 
-        // Parse optional params
-        const auto from_opt = parse_ll(req.get_param_value("from"));
-        const auto to_opt   = parse_ll(req.get_param_value("to"));
-        long long from_ms = from_opt.value_or(0);
-        long long to_ms   = to_opt.value_or(std::numeric_limits<long long>::max());
+        const auto from_ms = parse_int64(req.get_param_value("from")).value_or(0);
+        const auto to_ms = parse_int64(req.get_param_value("to")).value_or(std::numeric_limits<long long>::max());
 
         auto labels = parse_label_filters(req.get_param_value("labels"));
-        if (labels.find("host") == labels.end() && !cfg::HOST_LABEL.empty())
+        if (!cfg::HOST_LABEL.empty() && labels.find("host") == labels.end()) {
             labels.emplace("host", cfg::HOST_LABEL);
+        }
 
-        // Validate against registry
-        std::string err;
-        if (!validate_metric_and_labels(metric_name, labels, err))
-            return write_error(res, 422, err);
+        std::string error_message;
+        if (!validate_metric_and_labels(metric_name, labels, error_message)) {
+            return write_error_response(res, 422, error_message);
+        }
 
-        const auto selector = build_selector(metric_name, labels);
-
-        // detect vector metric by checking if it exists in vec store
-        bool is_vector = store.vec_series_exists(selector);
+        const std::string selector = build_selector(metric_name, labels);
+        const bool is_vector_metric = store.vec_series_exists(selector);
 
         json samples = json::array();
-
-        if (is_vector) {
-            auto rows = store.query_vector(selector, from_ms, to_ms);
-            for (auto &r : rows)
-                samples.push_back({ r.ts_ms, r.vals });
+        if (is_vector_metric) {
+            for (const auto& sample : store.query_vector(selector, from_ms, to_ms)) {
+                samples.push_back({sample.ts_ms, sample.vals});
+            }
         } else {
-            auto rows = store.query(selector, from_ms, to_ms);
-            for (auto &r : rows)
-                samples.push_back({ r.ts_ms, r.value });
+            for (const auto& sample : store.query(selector, from_ms, to_ms)) {
+                samples.push_back({sample.ts_ms, sample.value});
+            }
         }
 
-        json labels_json = json::object();
-        for (auto &[k,v] : labels) labels_json[k] = v;
-
-
-        write_json(res, json{
-                {"metric", metric_name},
-                {"unit",   unit_for_metric(metric_name)},
-                {"labels", labels_json},
-                {"samples", samples},
-                {"vector", is_vector}
-        });
+        write_json_response(res, json{{"metric", metric_name},
+                                      {"unit", infer_unit_for_metric(metric_name)},
+                                      {"labels", labels_to_json(labels)},
+                                      {"samples", samples},
+                                      {"vector", is_vector_metric}});
     });
 
-    // in your route binder
-    svr.Get("/api/processes", [&store](const httplib::Request&, httplib::Response& res){
-        nlohmann::json j = store.get_snapshot("processes");
-        if (j.is_null()) j = nlohmann::json::array();
-        write_json(res, j);
+    svr.Get("/api/processes", [&store](const httplib::Request&, httplib::Response& res) {
+        json snapshot = store.get_snapshot("processes");
+        if (snapshot.is_null()) {
+            snapshot = json::array();
+        }
+        write_json_response(res, snapshot);
     });
 
-    // /api/export — same query params as /timeseries + format
-    svr.Get("/api/export", [&store](const httplib::Request& req, httplib::Response& res){
+    svr.Get("/api/export", [&store](const httplib::Request& req, httplib::Response& res) {
         const std::string metric_name = req.get_param_value("metric");
-        const std::string from_str    = req.get_param_value("from");
-        const std::string to_str      = req.get_param_value("to");
-        const std::string format      = req.get_param_value("format");
+        const std::string from_str = req.get_param_value("from");
+        const std::string to_str = req.get_param_value("to");
+        const std::string format = req.get_param_value("format");
 
-        if (metric_name.empty())
-            return write_error(res, 400, "Missing required parameter 'metric'");
-        if (from_str.empty() || to_str.empty())
-            return write_error(res, 400, "Missing required parameter 'from' or 'to'");
-        if (format != "csv" && format != "json")
-            return write_error(res, 400, "Parameter 'format' must be 'csv' or 'json'");
+        if (metric_name.empty()) {
+            return write_error_response(res, 400, "Missing required parameter 'metric'");
+        }
+        if (from_str.empty() || to_str.empty()) {
+            return write_error_response(res, 400, "Missing required parameter 'from' or 'to'");
+        }
+        if (format != "csv" && format != "json") {
+            return write_error_response(res, 400, "Parameter 'format' must be 'csv' or 'json'");
+        }
 
-        const auto from_ms = parse_ll(from_str);
-        const auto to_ms   = parse_ll(to_str);
-        if (!from_ms.has_value() || !to_ms.has_value())
-            return write_error(res, 400, "Parameters 'from' and 'to' must be epoch milliseconds (integers)");
-        if (*from_ms > *to_ms)
-            return write_error(res, 400, "'from' must be <= 'to'");
+        const auto from_ms = parse_int64(from_str);
+        const auto to_ms = parse_int64(to_str);
+        if (!from_ms.has_value() || !to_ms.has_value()) {
+            return write_error_response(res, 400, "Parameters 'from' and 'to' must be epoch milliseconds (integers)");
+        }
+        if (*from_ms > *to_ms) {
+            return write_error_response(res, 400, "'from' must be <= 'to'");
+        }
 
         auto labels = parse_label_filters(req.get_param_value("labels"));
-        if (labels.find("host") == labels.end() && !cfg::HOST_LABEL.empty())
+        if (!cfg::HOST_LABEL.empty() && labels.find("host") == labels.end()) {
             labels.emplace("host", cfg::HOST_LABEL);
-
-        std::string err;
-        if (!validate_metric_and_labels(metric_name, labels, err)) {
-            return write_error(res, 422, err);
         }
 
-        const auto limit_opt = parse_ll(req.get_param_value("limit"));
+        std::string error_message;
+        if (!validate_metric_and_labels(metric_name, labels, error_message)) {
+            return write_error_response(res, 422, error_message);
+        }
+
+        const auto limit_opt = parse_int64(req.get_param_value("limit"));
         const long long limit = (limit_opt && *limit_opt > 0) ? *limit_opt : std::numeric_limits<long long>::max();
 
-        const auto selector = build_selector(metric_name, labels);
-
-        std::vector<Sample> data = store.query(selector, *from_ms, *to_ms);
-        if (static_cast<long long>(data.size()) > limit) {
-            data.erase(data.begin(), data.end() - static_cast<size_t>(limit));
+        const std::string selector = build_selector(metric_name, labels);
+        std::vector<Sample> rows = store.query(selector, *from_ms, *to_ms);
+        if (static_cast<long long>(rows.size()) > limit) {
+            rows.erase(rows.begin(), rows.end() - static_cast<size_t>(limit));
         }
 
         if (format == "csv") {
-            return write_csv(res, data, "export.csv");
+            return write_csv_response(res, rows, "export.csv");
         }
 
-        // format == json — mirror /timeseries payload
         json samples = json::array();
-        for (const auto& s : data) samples.push_back({s.ts_ms, s.value});
+        for (const auto& row : rows) {
+            samples.push_back({row.ts_ms, row.value});
+        }
 
-        json labels_json = json::object();
-        for (const auto& [k, v] : labels) labels_json[k] = v;
-
-        write_json(res, json{
-                {"metric",  metric_name},
-                {"unit",    unit_for_metric(metric_name)},
-                {"rollup",  "raw"},
-                {"labels",  labels_json},
-                {"samples", samples}
-        });
+        write_json_response(res, json{{"metric", metric_name},
+                                      {"unit", infer_unit_for_metric(metric_name)},
+                                      {"rollup", "raw"},
+                                      {"labels", labels_to_json(labels)},
+                                      {"samples", samples}});
     });
 }
