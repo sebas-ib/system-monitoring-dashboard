@@ -177,5 +177,14 @@ thead th .grip:hover{ background:rgba(0,0,0,.02); }
     height: 420px;   /* slightly shorter to fit more */
 }
 
+.disk-chart {
+    width: 100%;
+    height: 420px;   /* slightly shorter to fit more */
+}
+
+.net-chart {
+    width: 100%;
+    height: 420px;   /* slightly shorter to fit more */
+}
 /* ---------- Utilities ---------- */
 .hidden{ display: none !important; }
