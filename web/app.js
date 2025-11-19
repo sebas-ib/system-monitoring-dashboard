@@ -1,13 +1,26 @@
 // web/app.js — orchestrates dashboard charts, process table, and interactions.
+//
+// Polling overview:
+// - Each chart is registered with a ChartRegistry which keeps an in-memory buffer of
+//   timestamps + values and the last timestamp received from the backend.
+// - A lightweight ticker (makePoller) invokes the registry refresh for the active tab
+//   every ~1s. Hidden tabs keep their state but the poller is paused, so they do not
+//   hit /api/query until re-activated.
+// - Every refresh only asks the backend for new samples (`from = lastTs + 1`), then
+//   appends them to the buffer and trims anything older than the selected time window
+//   (sliding window, default 10 minutes).
+// - The process table has its own ticker so that chart polling and /api/processes do
+//   not contend with each other.
 
-// -------------------------
+
 // Constants & State
-// -------------------------
-
 const API_BASE_URL = "http://192.168.73.143:8080";
 const PROCESS_REFRESH_MS = 1000;
 const CHART_REFRESH_MS = 1000;
-const CORE_REFRESH_MS = 1000;
+const DEFAULT_TIME_WINDOW_S = 7200;
+const MAX_POINTS_PAD = 30; // additional guardrail beyond expected samples
+
+window.TIME_WINDOW_S = DEFAULT_TIME_WINDOW_S;
 
 let cpuTotalChart;
 let perCoreChart;
@@ -33,14 +46,11 @@ const NETWORK_DASHBOARD = {
 };
 
 const BASE_DATAZOOM = [
-    { type: "inside", start: 70, end: 100, minSpan: 1 },
-    { type: "slider", show: true, bottom: 25, height: 30, start: 70, end: 100, handleSize: 12, showDetail: true }
+    {type: "inside", start: 70, end: 100, minSpan: 1},
+    {type: "slider", show: true, bottom: 25, height: 30, start: 70, end: 100, handleSize: 12, showDetail: true}
 ];
 
-// -------------------------
 // Utilities (formatters, conversions)
-// -------------------------
-
 function formatNumber(num, decimals = 2) {
     return Number(num.toFixed(decimals));
 }
@@ -88,10 +98,7 @@ const fmt = {
     }
 };
 
-// -------------------------
 // API Requests
-// -------------------------
-
 async function fetchSystemInfo() {
     const response = await fetch(`${API_BASE_URL}/api/info?key=system`);
     return response.json();
@@ -108,8 +115,8 @@ async function fetchStoredMetrics() {
     }
 }
 
-async function fetchTimeseriesData({ metric, labels = null, from = 0, to = Date.now() }) {
-    const query = new URLSearchParams({ metric, from: String(from), to: String(to) });
+async function fetchTimeseriesData({metric, labels = null, from = 0, to = Date.now()}) {
+    const query = new URLSearchParams({metric, from: String(from), to: String(to)});
 
     if (labels && typeof labels === "object") {
         const labelPairs = Object.entries(labels)
@@ -129,31 +136,10 @@ async function fetchProcessesSnapshot() {
     return response.json();
 }
 
-// -------------------------
 // Data Processing
-// -------------------------
-
 async function initializeSystemMetadata() {
     const metadata = await fetchSystemInfo();
     TOTAL_MEM_BYTES = metadata.mem_total_bytes || 0;
-}
-
-/**
- * Normalize the API response into chart-ready payloads.
- * NOTE: no [unit] in the label here; we append final unit later.
- */
-function buildSeriesPayload(info) {
-    const samples = Array.isArray(info.samples)
-        ? info.samples.slice().sort((a, b) => a[0] - b[0])
-        : [];
-
-    const labels = samples.map(([ts]) => new Date(ts).toLocaleTimeString());
-    const data   = samples.map(([, v]) => v);
-    const unit   = (info.unit || "").trim();
-    const host   = info.labels?.host ? ` (${info.labels.host})` : "";
-
-    const datasetLabel = `${info.metric}${host}`;
-    return { labels, data, unit, datasetLabel };
 }
 
 /**
@@ -161,7 +147,7 @@ function buildSeriesPayload(info) {
  */
 function buildCoreSeries(samples) {
     if (!samples.length) {
-        return { labels: [], series: [] };
+        return {labels: [], series: []};
     }
 
     const labels = samples.map(([timestamp]) => new Date(timestamp).toLocaleTimeString());
@@ -175,24 +161,21 @@ function buildCoreSeries(samples) {
         });
     }
 
-    return { labels, series };
+    return {labels, series};
 }
 
-// -------------------------
 // Chart Engine
-// -------------------------
-
 function makeBaseOption(titleText = "") {
     return {
         animation: true,
-        toolbox: { feature: { dataZoom: { yAxisIndex: "none" }, restore: {}, saveAsImage: {} } },
-        title: { text: titleText },
-        tooltip: { trigger: "axis" },
-        grid: { left: 40, right: 20, top: 80, bottom: 80 },
-        xAxis: { type: "category", data: [] },
-        yAxis: { type: "value", min: 0, axisLabel: { formatter: value => value } },
+        toolbox: {feature: {dataZoom: {yAxisIndex: "none"}, restore: {}, saveAsImage: {}}},
+        title: {text: titleText},
+        tooltip: {trigger: "axis"},
+        grid: {left: 40, right: 20, top: 80, bottom: 80},
+        xAxis: {type: "category", data: []},
+        yAxis: {type: "value", min: 0, axisLabel: {formatter: value => value}},
         dataZoom: BASE_DATAZOOM,
-        series: [{ name: titleText, type: "line", showSymbol: false, areaStyle: { opacity: 0.18 }, data: [] }]
+        series: [{name: titleText, type: "line", showSymbol: false, areaStyle: {opacity: 0.18}, data: []}]
     };
 }
 
@@ -202,23 +185,23 @@ function makeBaseOption(titleText = "") {
 function renderTimeseriesChart(chart, payload) {
     if (!chart || !payload) return;
 
-    let { labels, data, unit, datasetLabel } = payload;
+    let {labels, data, unit, datasetLabel} = payload;
 
     if (!data || data.length === 0) {
         // Nothing yet: keep axes but clear series
         chart.setOption({
-            xAxis: { type: "category", data: labels || [] },
-            series: [{ type: "line", data: [] }]
+            xAxis: {type: "category", data: labels || []},
+            series: [{type: "line", data: []}]
         });
         return;
     }
 
     // Detect before modifying datasetLabel
-    const isPercentage   = unit === "%" || datasetLabel.includes("pct");
+    const isPercentage = unit === "%" || datasetLabel.includes("pct");
     const isMemoryMetric = datasetLabel.startsWith("mem.");
-    const isDiskMetric   = datasetLabel.startsWith("disk.");
-    const isNetMetric    = datasetLabel.startsWith("net.");
-    const isThroughput   = isDiskMetric || isNetMetric; // bytes/sec → KB/s / MB/s
+    const isDiskMetric = datasetLabel.startsWith("disk.");
+    const isNetMetric = datasetLabel.startsWith("net.");
+    const isThroughput = isDiskMetric || isNetMetric; // bytes/sec → KB/s / MB/s
 
     let yMax = null;
 
@@ -261,10 +244,15 @@ function renderTimeseriesChart(chart, payload) {
         if (yMax === 0) yMax = 1;
     }
 
+
+    if (!isPercentage && typeof yMax === "number" && Number.isFinite(yMax)) {
+        yMax = Number(yMax.toFixed(2));
+    }
+
     const titleUnit = !isPercentage && unit ? ` [${unit}]` : "";
 
     chart.setOption({
-        title: { text: datasetLabel + titleUnit, left: "center" },
+        title: {text: datasetLabel + titleUnit, left: "center"},
         tooltip: {
             trigger: "axis",
             formatter: params => {
@@ -277,13 +265,18 @@ function renderTimeseriesChart(chart, payload) {
                 return `${label}<br>${formatNumber(value, 2)} ${unit}`;
             }
         },
-        xAxis: { type: "category", data: labels },
+        xAxis: {type: "category", data: labels},
         yAxis: {
             type: "value",
             min: 0,
             max: yMax,
             axisLabel: {
-                formatter: v => isPercentage ? `${v}%` : `${v} ${unit}`
+                formatter: v => {
+                    if (isPercentage) {
+                        return `${formatNumber(v, 0)}%`;      // 0, 10, 20...
+                    }
+                    return `${formatNumber(v, 2)} ${unit}`;   // 0.00, 3.25, 6.50 KB/s
+                }
             }
         },
         series: [{
@@ -295,47 +288,107 @@ function renderTimeseriesChart(chart, payload) {
     }, false, false, ["series", "xAxis", "yAxis", "title"]);
 }
 
+function getWindowMs() {
+    const seconds = Number(window.TIME_WINDOW_S) || DEFAULT_TIME_WINDOW_S;
+    return seconds * 1000;
+}
+
+function getMaxPoints() {
+    return Math.max(60, Math.ceil(getWindowMs() / CHART_REFRESH_MS) + MAX_POINTS_PAD);
+}
+
 /**
- * Keeps track of metrics and refreshes them together.
+ * Keeps track of metrics, their buffers, and incremental refresh.
  */
 class ChartRegistry {
     constructor() {
-        this.items = [];
+        this.entries = [];
     }
 
-    registerChart({ chart, metric, labels = null, title = metric }) {
+    registerChart({chart, metric, labels = null, title = metric}) {
         chart.setOption(makeBaseOption(title));
-        const refresh = async () => {
-            try {
-                const info = await fetchTimeseriesData({ metric, labels });
-                const payload = buildSeriesPayload(info);
-                renderTimeseriesChart(chart, payload);
-            } catch (_) { /* swallow to keep polling */ }
+        const entry = {
+            chart,
+            metric,
+            labels,
+            title,
+            lastTs: 0,
+            unit: "",
+            buffer: {timestamps: [], values: []}
         };
-        this.items.push({ refresh });
-        return refresh;
+        this.entries.push(entry);
+        return entry;
+    }
+
+    resetState() {
+        this.entries.forEach(entry => {
+            entry.lastTs = 0;
+            entry.buffer.timestamps = [];
+            entry.buffer.values = [];
+        });
+    }
+
+    async refreshEntry(entry) {
+        if (!entry.chart) return;
+
+        const now = Date.now();
+        const windowMs = getWindowMs();
+        const from = entry.lastTs ? entry.lastTs + 1 : Math.max(0, now - windowMs);
+        let info;
+        try {
+            info = await fetchTimeseriesData({metric: entry.metric, labels: entry.labels, from, to: now});
+        } catch (error) {
+            console.error(`Failed to refresh ${entry.metric}`, error);
+            return;
+        }
+
+        const samples = Array.isArray(info?.samples) ? info.samples : [];
+        if (samples.length) {
+            entry.lastTs = samples[samples.length - 1][0];
+            for (const [ts, value] of samples) {
+                entry.buffer.timestamps.push(ts);
+                entry.buffer.values.push(value);
+            }
+        }
+
+        const windowStart = now - windowMs;
+        while (entry.buffer.timestamps.length && entry.buffer.timestamps[0] < windowStart) {
+            entry.buffer.timestamps.shift();
+            entry.buffer.values.shift();
+        }
+
+        const maxPoints = getMaxPoints();
+        while (entry.buffer.timestamps.length > maxPoints) {
+            entry.buffer.timestamps.shift();
+            entry.buffer.values.shift();
+        }
+
+        const labels = entry.buffer.timestamps.map(ts => new Date(ts).toLocaleTimeString());
+        if (info?.unit) entry.unit = info.unit;
+        const payload = {
+            labels,
+            data: entry.buffer.values.slice(),
+            unit: entry.unit,
+            datasetLabel: entry.title || info?.metric || entry.metric
+        };
+        renderTimeseriesChart(entry.chart, payload);
     }
 
     async refreshAll() {
-        for (const item of this.items) {
-            await item.refresh();
-        }
+        await Promise.all(this.entries.map(entry => this.refreshEntry(entry)));
     }
 }
 
-const CPU_REGISTRY  = new ChartRegistry();
-const MEM_REGISTRY  = new ChartRegistry();
+const CPU_REGISTRY = new ChartRegistry();
+const MEM_REGISTRY = new ChartRegistry();
 const DISK_REGISTRY = new ChartRegistry();
-const NET_REGISTRY  = new ChartRegistry();
+const NET_REGISTRY = new ChartRegistry();
 
-// -------------------------
 // UI Rendering - CPU
-// -------------------------
-
 function initCpuTotalChart() {
     const container = document.getElementById("chart-obj");
     cpuTotalChart = echarts.init(container);
-    CPU_REGISTRY.registerChart({ chart: cpuTotalChart, metric: "cpu.total_pct", title: "cpu.total_pct" });
+    CPU_REGISTRY.registerChart({chart: cpuTotalChart, metric: "cpu.total_pct", title: "cpu.total_pct"});
 }
 
 function initPerCoreChart() {
@@ -345,8 +398,8 @@ function initPerCoreChart() {
     perCoreChart = echarts.init(container);
     perCoreChart.setOption({
         ...makeBaseOption("cpu.core_pct (per-core)"),
-        legend: { top: 40 },
-        yAxis: { type: "value", min: 0, max: 100, axisLabel: { formatter: value => `${value}%` } },
+        legend: {top: 40},
+        yAxis: {type: "value", min: 0, max: 100, axisLabel: {formatter: value => `${value}%`}},
         series: [],
         tooltip: {
             trigger: "axis",
@@ -373,31 +426,62 @@ function renderPerCoreChart(labels, coreSeries) {
     if (!perCoreChart) return;
 
     perCoreChart.setOption({
-        xAxis: { data: labels },
+        xAxis: {data: labels},
         series: coreSeries.map(seriesItem => ({
             name: `core ${seriesItem.core}`,
             type: "line",
             showSymbol: false,
-            areaStyle: { opacity: 0.18 },
+            areaStyle: {opacity: 0.18},
             data: seriesItem.data
         })),
-        legend: { data: coreSeries.map(seriesItem => `core ${seriesItem.core}`) }
+        legend: {data: coreSeries.map(seriesItem => `core ${seriesItem.core}`)}
     }, false, false, ["series", "xAxis", "legend"]);
 }
 
-async function loadAndRenderPerCoreData() {
-    const info = await fetchTimeseriesData({ metric: "cpu.core_pct", from: 0, to: Date.now() });
-    if (!info.vector) return;
-    const samples = info.samples || [];
-    if (!samples.length) return;
-    const { labels, series } = buildCoreSeries(samples);
+const CORE_STATE = {
+    samples: [],
+    lastTs: 0
+};
+
+function resetCoreState() {
+    CORE_STATE.samples = [];
+    CORE_STATE.lastTs = 0;
+}
+
+async function refreshPerCoreData() {
+    const now = Date.now();
+    const windowMs = getWindowMs();
+    const from = CORE_STATE.lastTs ? CORE_STATE.lastTs + 1 : Math.max(0, now - windowMs);
+    let info;
+    try {
+        info = await fetchTimeseriesData({metric: "cpu.core_pct", from, to: now});
+    } catch (error) {
+        console.error("Failed to refresh cpu.core_pct", error);
+        return;
+    }
+
+    const samples = Array.isArray(info?.samples) ? info.samples : [];
+    if (samples.length) {
+        CORE_STATE.lastTs = samples[samples.length - 1][0];
+        CORE_STATE.samples.push(...samples);
+    }
+
+    const windowStart = now - windowMs;
+    while (CORE_STATE.samples.length && CORE_STATE.samples[0][0] < windowStart) {
+        CORE_STATE.samples.shift();
+    }
+
+    const maxPoints = getMaxPoints();
+    while (CORE_STATE.samples.length > maxPoints) {
+        CORE_STATE.samples.shift();
+    }
+
+    if (!CORE_STATE.samples.length) return;
+    const {labels, series} = buildCoreSeries(CORE_STATE.samples);
     renderPerCoreChart(labels, series);
 }
 
-// -------------------------
 // UI Rendering - Disk
-// -------------------------
-
 async function setupDiskCharts() {
     if (DISK_DASHBOARD.ready) return;
 
@@ -429,7 +513,7 @@ async function setupDiskCharts() {
             DISK_REGISTRY.registerChart({
                 chart,
                 metric: entry.metric,
-                labels: { dev: deviceName },
+                labels: {dev: deviceName},
                 title: `${entry.metric} (${deviceName})`
             });
 
@@ -444,10 +528,7 @@ async function setupDiskCharts() {
     DISK_DASHBOARD.ready = true;
 }
 
-// -------------------------
 // UI Rendering - Memory
-// -------------------------
-
 async function setupMemoryCharts() {
     if (MEMORY_DASHBOARD.ready) return;
 
@@ -470,7 +551,7 @@ async function setupMemoryCharts() {
         wrapper.appendChild(container);
 
         const chart = echarts.init(container);
-        MEM_REGISTRY.registerChart({ chart, metric, title: metric });
+        MEM_REGISTRY.registerChart({chart, metric, title: metric});
         MEMORY_DASHBOARD.charts.set(metric, chart);
     });
 
@@ -478,10 +559,7 @@ async function setupMemoryCharts() {
     MEMORY_DASHBOARD.ready = true;
 }
 
-// -------------------------
 // UI Rendering - Network
-// -------------------------
-
 async function setupNetworkCharts() {
     if (NETWORK_DASHBOARD.ready) return;
 
@@ -513,7 +591,7 @@ async function setupNetworkCharts() {
             NET_REGISTRY.registerChart({
                 chart,
                 metric: entry.metric,
-                labels: { iface: ifaceName },
+                labels: {iface: ifaceName},
                 title: `${entry.metric} (${ifaceName})`
             });
 
@@ -528,10 +606,7 @@ async function setupNetworkCharts() {
     NETWORK_DASHBOARD.ready = true;
 }
 
-// -------------------------
 // Processes table
-// -------------------------
-
 function renderProcessTable(rows) {
     const tbody = document.querySelector("#proc-table tbody");
     const fragment = document.createDocumentFragment();
@@ -599,17 +674,14 @@ function enableProcessTableColumnResize() {
         grip.addEventListener("touchstart", event => {
             startX = event.touches[0].clientX;
             startWidth = th.getBoundingClientRect().width;
-            window.addEventListener("touchmove", onMove, { passive: false });
+            window.addEventListener("touchmove", onMove, {passive: false});
             window.addEventListener("touchend", onUp);
             event.preventDefault();
-        }, { passive: false });
+        }, {passive: false});
     });
 }
 
-// -------------------------
 // Tabs & time range
-// -------------------------
-
 function activatePanel(panelId, tabBtn) {
     document.querySelectorAll(".panel").forEach(panel => panel.classList.add("hidden"));
     document.getElementById(panelId)?.classList.remove("hidden");
@@ -620,47 +692,16 @@ function activatePanel(panelId, tabBtn) {
     tabBtn.setAttribute("aria-selected", "true");
 
     ACTIVE_TAB =
-        panelId === "panel-cpu"  ? "cpu"  :
-            panelId === "panel-mem"  ? "mem"  :
+        panelId === "panel-cpu" ? "cpu" :
+            panelId === "panel-mem" ? "mem" :
                 panelId === "panel-disk" ? "disk" :
                     "net";
 }
 
-function wireTabs() {
-    const cpuBtn  = document.getElementById("tab-cpu");
-    const memBtn  = document.getElementById("tab-mem");
-    const diskBtn = document.getElementById("tab-disk");
-    const netBtn  = document.getElementById("tab-net");
-
-    cpuBtn?.addEventListener("click", () =>
-        activatePanel("panel-cpu", cpuBtn)
-    );
-
-    memBtn?.addEventListener("click", async () => {
-        activatePanel("panel-mem", memBtn);
-        await setupMemoryCharts();
-        await MEM_REGISTRY.refreshAll();
-    });
-
-    diskBtn?.addEventListener("click", async () => {
-        activatePanel("panel-disk", diskBtn);
-        await setupDiskCharts();
-        await DISK_REGISTRY.refreshAll();
-    });
-
-    netBtn?.addEventListener("click", async () => {
-        activatePanel("panel-net", netBtn);
-        await setupNetworkCharts();
-        await NET_REGISTRY.refreshAll();
-    });
-}
-
-function selectTimeFrame(seconds) {
-    window.TIME_WINDOW_S = Number(seconds);
-
+function refreshActiveTabNow() {
     if (ACTIVE_TAB === "cpu") {
         CPU_REGISTRY.refreshAll();
-        loadAndRenderPerCoreData();
+        refreshPerCoreData();
     } else if (ACTIVE_TAB === "mem") {
         MEM_REGISTRY.refreshAll();
     } else if (ACTIVE_TAB === "disk") {
@@ -669,12 +710,127 @@ function selectTimeFrame(seconds) {
         NET_REGISTRY.refreshAll();
     }
 }
+
+function stopAllTabPollers() {
+    Object.values(TAB_POLLERS).forEach(poller => poller.stop());
+}
+
+function syncActiveTabPolling() {
+    stopAllTabPollers();
+    TAB_POLLERS[ACTIVE_TAB]?.start();
+}
+
+function wireTabs() {
+    const cpuBtn = document.getElementById("tab-cpu");
+    const memBtn = document.getElementById("tab-mem");
+    const diskBtn = document.getElementById("tab-disk");
+    const netBtn = document.getElementById("tab-net");
+
+    cpuBtn?.addEventListener("click", () => {
+        activatePanel("panel-cpu", cpuBtn);
+        syncActiveTabPolling();
+    });
+
+    memBtn?.addEventListener("click", async () => {
+        activatePanel("panel-mem", memBtn);
+        stopAllTabPollers();
+        await setupMemoryCharts();
+        await MEM_REGISTRY.refreshAll();
+        syncActiveTabPolling();
+    });
+
+    diskBtn?.addEventListener("click", async () => {
+        activatePanel("panel-disk", diskBtn);
+        stopAllTabPollers();
+        await setupDiskCharts();
+        await DISK_REGISTRY.refreshAll();
+        syncActiveTabPolling();
+    });
+
+    netBtn?.addEventListener("click", async () => {
+        activatePanel("panel-net", netBtn);
+        stopAllTabPollers();
+        await setupNetworkCharts();
+        await NET_REGISTRY.refreshAll();
+        syncActiveTabPolling();
+    });
+}
+
+function selectTimeFrame(seconds) {
+    window.TIME_WINDOW_S = Number(seconds);
+
+    CPU_REGISTRY.resetState();
+    MEM_REGISTRY.resetState();
+    DISK_REGISTRY.resetState();
+    NET_REGISTRY.resetState();
+    resetCoreState();
+    refreshActiveTabNow();
+}
+
 window.selectTimeFrame = selectTimeFrame;
 
-// -------------------------
-// Bootstrapping
-// -------------------------
+function makePoller(task, intervalMs) {
+    let timer = null;
+    let stopped = true;
+    let inFlight = false;
 
+    const scheduleNext = () => {
+        if (stopped) return;
+        timer = setTimeout(run, intervalMs);
+    };
+
+    const run = async () => {
+        if (stopped) return;
+        if (inFlight) {
+            scheduleNext();
+            return;
+        }
+        inFlight = true;
+        try {
+            await task();
+        } catch (error) {
+            console.error("poller task failed", error);
+        } finally {
+            inFlight = false;
+            scheduleNext();
+        }
+    };
+
+    return {
+        start() {
+            if (!stopped) return;
+            stopped = false;
+            run();
+        },
+        stop() {
+            stopped = true;
+            if (timer) {
+                clearTimeout(timer);
+                timer = null;
+            }
+        }
+    };
+}
+
+const TAB_POLLERS = {
+    cpu: makePoller(async () => {
+        await CPU_REGISTRY.refreshAll();
+        await refreshPerCoreData();
+    }, CHART_REFRESH_MS),
+    mem: makePoller(async () => {
+        await MEM_REGISTRY.refreshAll();
+    }, CHART_REFRESH_MS),
+    disk: makePoller(async () => {
+        await DISK_REGISTRY.refreshAll();
+    }, CHART_REFRESH_MS),
+    net: makePoller(async () => {
+        await NET_REGISTRY.refreshAll();
+    }, CHART_REFRESH_MS)
+};
+
+const PROCESS_POLLER = makePoller(loadProcesses, PROCESS_REFRESH_MS);
+
+// Bootstrapping
 document.addEventListener("DOMContentLoaded", async () => {
     await initializeSystemMetadata();
 
@@ -683,33 +839,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     wireTabs();
     enableProcessTableColumnResize();
 
-    loadProcesses();
-    await loadAndRenderPerCoreData();
+    await CPU_REGISTRY.refreshAll();
+    await refreshPerCoreData();
 
-    setInterval(loadProcesses, PROCESS_REFRESH_MS);
-
-    setInterval(() => {
-        if (ACTIVE_TAB === "cpu") {
-            CPU_REGISTRY.refreshAll();
-            loadAndRenderPerCoreData();
-        }
-    }, CHART_REFRESH_MS);
-
-    setInterval(() => {
-        if (ACTIVE_TAB === "mem") {
-            MEM_REGISTRY.refreshAll();
-        }
-    }, CHART_REFRESH_MS);
-
-    setInterval(() => {
-        if (ACTIVE_TAB === "disk") {
-            DISK_REGISTRY.refreshAll();
-        }
-    }, CHART_REFRESH_MS);
-
-    setInterval(() => {
-        if (ACTIVE_TAB === "net") {
-            NET_REGISTRY.refreshAll();
-        }
-    }, CHART_REFRESH_MS);
+    PROCESS_POLLER.start();
+    syncActiveTabPolling();
 });

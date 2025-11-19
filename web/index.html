@@ -13,7 +13,7 @@
 <body>
 <div class="dashboard">
     <!-- LEFT: Processes -->
-    <div class="card">
+    <div class="card card-procs">
         <h1>Processes</h1>
         <div class="table-wrap">
             <table id="proc-table">
@@ -54,7 +54,8 @@
         </div>
     </div>
 
-    <div class="card">
+    <!-- RIGHT: Charts -->
+    <div class="card card-metrics">
         <div class="tabs" role="tablist" aria-label="Metrics">
             <button class="tab-btn" role="tab" id="tab-cpu"   aria-controls="panel-cpu"   aria-selected="true">CPU</button>
             <button class="tab-btn" role="tab" id="tab-mem"   aria-controls="panel-mem"   aria-selected="false">Memory</button>
@@ -67,21 +68,17 @@
             <div id="chart-cores"></div>
         </div>
 
-        <!-- ADD: Memory panel with container for multiple mem.* charts -->
         <div id="panel-mem" class="panel hidden">
             <div id="mem-charts" aria-live="polite"></div>
         </div>
 
-        <!-- (Optional placeholders you can implement later) -->
         <div id="panel-disk" class="panel hidden">
             <div id="disk-charts"></div>
         </div>
 
-
         <div id="panel-net"  class="panel hidden">
             <div id="net-charts"></div>
         </div>
-
     </div>
 </div>
 
