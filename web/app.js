@@ -14,7 +14,22 @@
 
 
 // Constants & State
-const API_BASE_URL = "http://192.168.73.143:8080";
+const DEFAULT_PORT = 8080;
+
+function resolveApiBase() {
+    const params = new URLSearchParams(window.location.search);
+    const override = params.get("api");
+    if (override) {
+        return override.replace(/\/+$/, "");  // trim trailing slash
+    }
+
+    // Otherwise: same host/port as the page
+    const { protocol, hostname, port } = window.location;
+    const effectivePort = port || DEFAULT_PORT;
+    return `${protocol}//${hostname}:${effectivePort}`;
+}
+
+const API_BASE_URL = resolveApiBase();
 const PROCESS_REFRESH_MS = 1000;
 const CHART_REFRESH_MS = 1000;
 const DEFAULT_TIME_WINDOW_S = 7200;
