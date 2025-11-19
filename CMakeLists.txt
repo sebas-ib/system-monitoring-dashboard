@@ -7,7 +7,8 @@ include_directories(${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
 
 # Pick collectors by OS
 set(COLLECTOR_SRCS collector/loop.cpp
-        collector/proc_linux.cpp)
+        collector/proc_linux.cpp
+        store/system_info.cpp)
 if(APPLE)
     list(APPEND COLLECTOR_SRCS
             collector/cpu_macos.cpp

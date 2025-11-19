@@ -15,22 +15,30 @@
 constexpr bool AGGREGATE_PARTITIONS = true;
 
 inline bool is_counted_device(const std::string& n){
+
+    if (n.rfind("dm-", 0) == 0) return false;
+
     // Drop purely virtual or optical devices
     return !(n.rfind("loop",0)==0 || n.rfind("ram",0)==0 ||
              n.rfind("sr",0)==0   || n.rfind("fd",0)==0);
 }
 
-static bool is_whole_device(const std::string& name){
-    if (name.rfind("loop", 0) == 0 || name.rfind("ram", 0) == 0 ||
-        name.rfind("sr", 0) == 0 || name.rfind("fd", 0) == 0) return false;
+inline bool is_whole_device(const std::string& name) {
+    // Ignore mapper devices
+    if (name.rfind("dm-", 0) == 0) return false;
+    // Ignore virtual
+    if (name.rfind("loop",0)==0 || name.rfind("ram",0)==0 ||
+        name.rfind("sr",0)==0   || name.rfind("fd",0)==0) return false;
 
-    // nvme0n1p1 -> partition (has 'p#') nvme0n1 -> whole device
-    if (name.rfind("nvme",0)==0) return name.find('p') == std::string::npos;
+    // NVMe: nvme0n1 is device, nvme0n1p1 is partition
+    if (name.rfind("nvme",0)==0)
+        return name.find('p') == std::string::npos;
 
-    if (!name.empty() && std::isdigit(static_cast<unsigned char>(name.back())))
+    // sdX or vda → whole, sdX1 or vda1 → partition
+    if (!name.empty() && isdigit(name.back()))
         return false;
 
-    return true; // sda, vda, ...
+    return true;
 }
 
 
@@ -146,7 +154,12 @@ bool get_disk_io(std::vector<DiskIO>& output){
     std::unordered_map<std::string, Delta> by_key;
     if (AGGREGATE_PARTITIONS) {
         for (const auto& [name, d] : deltas) {
-            auto& g = by_key[base_device_name(name)];
+            std::string key = base_device_name(name);
+
+            // skip partitions (sda1, sda2, sda3) → only keep sda
+            if (!is_whole_device(name)) continue;
+
+            auto& g = by_key[key];
             g.rd += d.rd;
             g.wr += d.wr;
         }
