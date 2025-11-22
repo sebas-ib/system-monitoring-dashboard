@@ -18,6 +18,22 @@ A lightweight, Linux system dashboard with a C++17 backend and a vanilla JS + EC
 - **Collectors & store:** `collector/` handles per-metric sampling from `/proc`; `store/` provides the ring buffer and system metadata.
 - **Frontend assets:** `web/` contains `index.html`, `app.js`, and `styles.css`, mounted by the binary (default `WEB_ROOT=./web`).
 
+## Screenshots
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/73b0db9d-3561-4458-b173-4a90f9278a7f" width="320" />
+  <img src="https://github.com/user-attachments/assets/4181e110-00ab-4455-b27e-4e569068c5d0" width="320" />
+  <img src="https://github.com/user-attachments/assets/62086a68-3a55-4268-92d5-de74ce62591d" width="320" />
+</p>
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/e68e15bc-44bc-4756-ae99-5944930e0331" width="320" />
+  <img src="https://github.com/user-attachments/assets/45036d25-e576-4bd1-af91-ca17ed7d8dce" width="320" />
+  <img src="https://github.com/user-attachments/assets/b621ad70-cb59-4345-848d-1037f848debb" width="320" />
+</p>
+
+
+
 ## Prerequisites
 Build tools on the Linux machine running the monitor:
 
