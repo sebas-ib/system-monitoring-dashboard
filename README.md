@@ -1,83 +1,94 @@
 # System Monitoring Dashboard
 
-A lightweight, Linux-first system dashboard with a C++17 backend and a vanilla JS + ECharts frontend. It samples CPU, memory, disk, network, and process data from `/proc`, stores it in an in-memory ring buffer, and exposes a small REST API alongside static web assets for a single-page UI.
+A lightweight, Linux system dashboard with a C++17 backend and a vanilla JS + ECharts frontend. It samples CPU, memory, disk, network, and process data from `/proc`, stores it in an in-memory ring buffer, and serves both a REST API and static single-page UI from the same binary.
+
+## Project Overview
+- Single binary that collects host metrics and exposes them via HTTP.
+- Serves the bundled frontend (HTML/JS/CSS) alongside the API so the UI and backend stay in sync.
+- Linux-focused (Debian/Ubuntu/Fedora tested) and built with CMake.
 
 ## Features
-- Real-time CPU, memory, disk, and network charts with sliding time windows.
-- Incremental polling on the frontend to keep bandwidth low while remaining ~1s responsive.
+- Real-time CPU, memory, disk, and network charts with sliding windows.
 - Process table with delta-aware refreshes to avoid redundant downloads.
-- REST API served by the same binary that also mounts the static UI assets.
-- Linux-focused collectors (Debian/Ubuntu tested) built with CMake.
+- Incremental polling on the frontend to stay ~1s responsive while keeping bandwidth low.
+- REST API and static assets served by the same process and port.
 
-## Repository layout & build entrypoints
+## Architecture / Components
 - **Backend:** `main.cpp` builds the `dashboard` binary via `CMakeLists.txt`, wiring collectors, in-memory storage, and HTTP routes in `api/routes.cpp`.
-- **Collectors & store:** `collector/` (per-metric sampling) and `store/` (ring buffer + system metadata).
-- **Frontend assets:** `web/` contains `index.html`, `app.js`, and `styles.css` served by the binary (mount point defaults to `./web`).
-- **Packaging:** `Dockerfile` (multi-stage runtime), `docker-compose.yml` example, and `packaging/systemd/system-monitoring-dashboard.service` for native installs.
+- **Collectors & store:** `collector/` handles per-metric sampling from `/proc`; `store/` provides the ring buffer and system metadata.
+- **Frontend assets:** `web/` contains `index.html`, `app.js`, and `styles.css`, mounted by the binary (default `WEB_ROOT=./web`).
 
-## Screenshots
-_Placeholder — drop your screenshots here (CPU dashboard, Memory tab, Process table, etc.)._
+## Prerequisites
+Build tools on the Linux machine running the monitor:
 
-## Quickstart (Docker)
+**Debian / Ubuntu**
 ```bash
-# Build the image
-sudo docker build -t system-monitoring-dashboard .
-
-# Run it (default PORT=8080; HOST_LABEL optional)
-sudo docker run -it --rm -p 8080:8080 \
-  -e HOST_LABEL="$(hostname)" \
-  -e PORT=8080 \
-  system-monitoring-dashboard
-```
-Open http://localhost:8080 in your browser (or use `?api=http://<host>:<port>` when accessing remotely).
-
-### docker-compose
-```bash
-HOST_LABEL=$(hostname) docker compose up --build
+sudo apt-get update
+sudo apt-get install -y build-essential cmake
 ```
 
-## Quickstart (native Linux)
+**Fedora / RHEL**
 ```bash
-sudo apt-get update && sudo apt-get install -y build-essential cmake
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-
-# Run from the repo root so WEB_ROOT=./web resolves
-PORT=8080 HOST_LABEL="$(hostname)" ./build/dashboard
+sudo dnf install -y gcc-c++ make cmake
 ```
-Then browse to http://localhost:8080 (or add `?api=http://server:8080` if the UI is opened from another machine).
 
-## Configuration
-- **PORT:** listening port for the HTTP server (default 8080).
-- **HOST_LABEL:** label attached to exported metrics and shown in the UI; defaults to the system hostname.
-- **WEB_ROOT:** path to static UI assets; defaults to `web` relative to the working directory.
-- **Frontend API base URL:** resolved at runtime from `window.location` and can be overridden via `?api=http://host:port` in the browser address bar.
-
-### Viewing another host's metrics
-- Run the `dashboard` binary (or Docker container) on the target Linux machine and ensure its port is reachable (e.g., `-p 8080:8080` in Docker or an opened firewall rule).
-- From any browser, navigate to the UI and point it at the remote API with `?api=http://<remote-host>:8080` (for example, `http://localhost:8080/?api=http://server:8080`). The SPA will poll the specified host for metrics while running locally.
-
-## API overview
-- `GET /api/info?key=system` — system metadata (hostname, cores, memory total, etc.).
-- `GET /api/status` — service status and uptime.
-- `GET /api/stored` — list of available metrics and label dimensions in the ring buffer.
-- `GET /api/query?metric=...&from=ms&to=ms[&labels=key:value]` — timeseries samples (vector series supported).
-- `GET /api/export?...` — export a series as CSV or JSON over a specified time window.
-- `GET /api/processes[?since=ms]` — latest process snapshot, optionally delta-optimized with `since`.
-
-## Deployment (non-Docker)
-- **systemd:** copy `packaging/systemd/system-monitoring-dashboard.service` to `/etc/systemd/system/`, adjust `WorkingDirectory`, `ExecStart`, and environment values, then `systemctl enable --now system-monitoring-dashboard`.
-- Ensure the working directory contains the `web/` assets (or set `WEB_ROOT` accordingly) so the UI is served alongside the API.
-
-## License
-Unless otherwise noted, this project is provided under the MIT license.
-
----
-### How to try it in 60 seconds
+## Installation
+Clone the repository on the target Linux host:
 ```bash
-# From a Linux shell with Docker available
+git clone https://github.com/sebas-ib/system-monitoring-dashboard.git
 cd system-monitoring-dashboard
-sudo docker build -t system-monitoring-dashboard .
-sudo docker run -p 8080:8080 system-monitoring-dashboard
-# Open http://localhost:8080 in your browser
 ```
+
+## How to Build
+From the repo root:
+```bash
+mkdir -p build
+cd build
+
+cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake --build . --target dashboard -j"$(nproc)"
+```
+This produces the `dashboard` executable in `build/`.
+
+## How to Run
+### Local run (single process / single port)
+Start the server from the build directory and point it at the `web` assets:
+```bash
+cd ~/system-monitoring-dashboard/build
+WEB_ROOT=../web HOST_LABEL="$(hostname)" PORT=8080 ./dashboard
+```
+- `WEB_ROOT` – location of the static frontend files (The server looks for WEB_ROOT relative to the current working directory (default web). When running from build/, use WEB_ROOT=../web.).
+- `HOST_LABEL` – label attached to exported metrics (defaults to the system hostname).
+- `PORT` – TCP port to listen on (defaults to `8080`).
+
+With the server running, open a browser on the same machine:
+```text
+http://localhost:8080
+```
+The UI lives at the root path, and API endpoints are under `/api/...`.
+
+### Viewing the dashboard remotely via SSH tunnel
+If the Linux machine is headless or remote, forward the port to your local machine (example values shown):
+```bash
+ssh -L 8080:localhost:8080 <user>@<server-ip>
+```
+Leave the SSH session open, then in your local browser visit:
+```text
+http://localhost:8080
+```
+Traffic flows from your laptop → SSH tunnel → `localhost:8080` on the Linux host where `dashboard` is running.
+
+## Usage
+- Browse to `http://<host>:<port>/` for the UI (or `?api=http://server:8080` to point the SPA at a different host).
+- Key API endpoints implemented in `api/routes.cpp`:
+  - `GET /api/info?key=system` — system metadata (hostname, cores, memory total, kernel, etc.).
+  - `GET /api/status` — basic health and uptime.
+  - `GET /api/metrics` — registry of metric names, units, and supported labels.
+  - `GET /api/stored` — list of stored metric selectors and label dimensions.
+  - `GET /api/query?metric=...&from=ms&to=ms[&labels=key:value]` — timeseries samples (vector series supported).
+  - `GET /api/export?metric=...&from=ms&to=ms&format=csv|json[&labels=key:value&limit=n]` — export a series.
+  - `GET /api/processes` — latest process snapshot.
+
+## Notes / Limitations
+- Linux-only: collectors depend on `/proc`; macOS collectors referenced in `CMakeLists.txt` are not present in this repository.
+- Ensure firewalls expose the chosen `PORT` if accessing remotely.
